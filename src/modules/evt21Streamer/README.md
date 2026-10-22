@@ -1,3 +1,2 @@
-The evt21Streamer module is responsible for owning the driver object from genx320Drvier and piping the evt21 bytes from the V4L2 buffer to a system memory buffer. 
-The evt21Streamer object will give any other program concurrent access to the evt21 stream.
-For example, a program may need to access the stream to decode the EVT21 and maintain a real time event histogram
+The evt21Streamer module is responsible for owning the driver object from genx320Drvier and giving another parent program access to the v4l2 buffers (size of 1024bytes x 32lines) containing evt2.1 words.
+The buffers must be presented with the type evt21_buffer (defined in types.h). The parent program must be able to call a function belonging to evt21Streamer and get the point of a evt21_buffer variable and perform operations on the data directly, when said operation are done the parent program can call another function belonging to evt21Streamer signaling when the buffer is done being used. The dequeue and queue logic of the v4l2 buffer will be handles internally. 

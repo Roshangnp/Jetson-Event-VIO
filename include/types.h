@@ -9,6 +9,7 @@ typedef uint32_t timestamp_us;
 typedef uint64_t evt21_word;
 typedef uint16_t histogram[cameraConfig::PIXEL_NUM];
 typedef timestamp_us time_surface[cameraConfig::PIXEL_NUM];
+typedef uint64_t* evt21_buffer;
 
 struct event {
     uint16_t x;
