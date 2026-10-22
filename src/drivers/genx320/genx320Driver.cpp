@@ -1,4 +1,4 @@
-#include "driver.h"
+#include "genx320Driver.h"
 
 #include <cerrno>
 #include <fcntl.h>
