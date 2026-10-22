@@ -25,9 +25,11 @@ public:
     // before restarting.
     void stop() noexcept;
 
-    // Wait for a buffer and return its mapped memory. Only wordCount() words
-    // are valid. Release it before getting another buffer. The pointer remains
-    // valid until releaseBuffer() or stop().
+    // Wait for a buffer, discard older completed buffers, and return the newest
+    // available when the ready queue is drained. Only wordCount() words are
+    // valid. Release before getting another; the pointer is valid until release
+    // or stop. The driver may complete another buffer after the queue is drained.
+    // If draining fails, the stream is stopped and must be initialized again.
     evt21_buffer getBuffer();
     void releaseBuffer();
     std::size_t wordCount() const noexcept { return word_count_; }
