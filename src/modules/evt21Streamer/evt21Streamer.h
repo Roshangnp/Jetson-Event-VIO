@@ -25,11 +25,9 @@ public:
     // before restarting.
     void stop() noexcept;
 
-    // Wait for a buffer, discard older completed buffers, and return the newest
-    // available when the ready queue is drained. Only wordCount() words are
-    // valid. Release before getting another; the pointer is valid until release
-    // or stop. The driver may complete another buffer after the queue is drained.
-    // If draining fails, the stream is stopped and must be initialized again.
+    // Wait for the next completed buffer returned by V4L2. Only wordCount()
+    // words are valid. Release before getting another; the pointer is valid
+    // until release or stop.
     evt21_buffer getBuffer();
     void releaseBuffer();
     std::size_t wordCount() const noexcept { return word_count_; }
