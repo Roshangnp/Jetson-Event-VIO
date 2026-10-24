@@ -2,14 +2,17 @@
 
 
 #include <cstdint>
-#include "cameraConfig.h"
+#include "config.h"
 
-typedef uint32_t timestamp_us;
+using timestamp_us = uint32_t;
 
-typedef uint64_t evt21_word;
-typedef uint16_t histogram[cameraConfig::PIXEL_NUM];
-typedef timestamp_us time_surface[cameraConfig::PIXEL_NUM];
-typedef uint64_t* evt21_buffer;
+
+using evt21_word = uint64_t;
+using evt21_buffer = uint64_t*;
+
+using histogram = uint16_t[cameraConfig::PIXEL_NUM];
+using time_surface = timestamp_us[cameraConfig::PIXEL_NUM];
+
 
 struct event {
     uint16_t x;
