@@ -1,4 +1,5 @@
 #include "../../src/drivers/genx320/genx320Driver.h"
+#include "../../src/drivers/genx320/v4l2Util.h"
 
 #include <cerrno>
 #include <chrono>
@@ -8,30 +9,13 @@
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <stdexcept>
-#include <system_error>
-#include <sys/ioctl.h>
 
-namespace {
+using v4l2_util::fail;
+using v4l2_util::xioctl;
 
-int xioctl(int fd, unsigned long request, void* argument) {
-    int result;
-    do {
-        result = ::ioctl(fd, request, argument);
-    } while (result == -1 && errno == EINTR);
-    return result;
-}
-
-void queueBuffer(int fd, std::uint32_t index) {
-    v4l2_buffer buffer{};
-    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buffer.memory = V4L2_MEMORY_MMAP;
-    buffer.index = index;
-    if (xioctl(fd, VIDIOC_QBUF, &buffer) == -1) {
-        throw std::system_error(errno, std::generic_category(), "VIDIOC_QBUF");
-    }
-}
-
-} // namespace
+// Captures one second of raw EVT2.1 words from the camera into ./log.raw.
+// Drives Genx320Driver directly (not Evt21Streamer) so the capture can stop
+// on a deadline even when no buffers arrive.
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -66,20 +50,18 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             if (poll_result == -1) {
-                throw std::system_error(errno, std::generic_category(), "poll");
+                fail("poll");
             }
             if (!(ready.revents & POLLIN)) {
                 throw std::runtime_error("camera poll failed");
             }
 
-            v4l2_buffer buffer{};
-            buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buffer.memory = V4L2_MEMORY_MMAP;
+            v4l2_buffer buffer = v4l2_util::makeBuffer();
             if (xioctl(driver.fd(), VIDIOC_DQBUF, &buffer) == -1) {
                 if (errno == EAGAIN) {
                     continue;
                 }
-                throw std::system_error(errno, std::generic_category(), "VIDIOC_DQBUF");
+                fail("VIDIOC_DQBUF");
             }
 
             const auto& mapped = driver.buffer(buffer.index);
@@ -92,7 +74,8 @@ int main(int argc, char* argv[]) {
             if (!output) {
                 throw std::runtime_error("could not write log.raw");
             }
-            queueBuffer(driver.fd(), buffer.index);
+            // Give the buffer back so the driver can fill it again.
+            v4l2_util::queueBuffer(driver.fd(), buffer.index);
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

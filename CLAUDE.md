@@ -25,12 +25,28 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude -Iconfig -c src/modules/addres
 
 There is no test framework or linter.
 
+The driver, `Evt21Streamer` and the capture test include `<linux/videodev2.h>`, so they only compile on Linux (the Jetson). On macOS they can be syntax-checked against a minimal stub `linux/videodev2.h` passed with `-isystem`, but that does not check them against real V4L2.
+
 ## Architecture
 
 Data flows driver → streamer → addressEventCamera (decoder, histograms, time surfaces) → future optic-flow / VIO.
 
-- **`Genx320Driver`** (`src/drivers/genx320/`) is raw V4L2. The EVT-format control (`0x00982903`, value 1 = EVT2.1) is set on the **sensor subdevice**; the MMAP streaming queue (8 buffers) lives on the **video device**, opened `O_NONBLOCK`. It exposes `fd()` and `buffer(index)` and leaves DQBUF/QBUF to its owner.
-- **`Evt21Streamer`** owns the driver and does poll/DQBUF/QBUF. `Evt21StreamerFromFile` replays a recorded `.evt21`/raw file. The two must keep **identical interfaces** so either can feed the pipeline: `initialize(source, sensor_device)`, `start()`, `stop()`, `getBuffer()` → `evt21_buffer` (`uint64_t*`), `wordCount()`, `releaseBuffer()`. Only one buffer may be held at a time; it must be released before the next `getBuffer()`. A camera buffer is zero-copy mapped memory and is requeued on release. The file streamer returns `nullptr` at EOF.
+- **`Genx320Driver`** (`src/drivers/genx320/`) is raw V4L2:
+  - The EVT-format control (`0x00982903`, value 1 = EVT2.1) is set on the **sensor subdevice**. That fd stays open for the session because some drivers reset controls on close.
+  - The MMAP streaming queue lives on the **video device**, opened `O_NONBLOCK`. 8 buffers are requested, but the driver may grant a different count, so code must use `bufferCount()`. A grant of 0 fails in `initialize()`.
+  - `initialize()` calls `stop()` first, so it is safe to call twice.
+  - It exposes `fd()`, `buffer(index)` (throws `std::out_of_range`) and `bufferCount()`, and leaves DQBUF/QBUF to its owner.
+- **`v4l2Util.h`** (`src/drivers/genx320/`, namespace `v4l2_util`) holds the header-only V4L2 helpers shared by the driver, the streamer and the capture test: `xioctl` (retries on EINTR), `fail` (throws `std::system_error` with errno), `makeBuffer(index)` (an MMAP capture `v4l2_buffer`) and `queueBuffer(fd, index)`. Use these rather than writing new copies.
+- **`Evt21Streamer`** owns the driver and does DQBUF/QBUF:
+  - Its lifecycle is a private `State` enum: `CLOSED` → `INITIALIZED` → `STREAMING` ⇄ `HOLDING`, and `stop()` returns it to `CLOSED`.
+  - `getBuffer()` tries `VIDIOC_DQBUF` first and only calls `poll()` on `EAGAIN`, so a buffer that is already waiting costs no poll syscall.
+  - The whole `getBuffer()` call has one deadline, `cameraConfig::BUFFER_TIMEOUT_MS` (500 ms, in `config/config.h`). If no buffer arrives in time it returns `nullptr` with nothing held and the stream still running, so the caller just calls it again. From the camera streamer, `nullptr` means "no data yet"; from the file streamer, it means EOF.
+  - Empty buffers are requeued and skipped.
+  - A buffer with the error flag, or a bad size, is requeued and reported as `std::runtime_error`. Requeue failures are ignored there so the original error is reported, and the stream keeps running.
+  - An out-of-range buffer index stops the stream.
+- The capture test (`tests/write_evt21_to_file`) drives `Genx320Driver` directly rather than `Evt21Streamer`, with its own 1 s capture deadline. It could now be moved onto `Evt21Streamer`, since `getBuffer()` times out.
+- `Evt21StreamerFromFile` replays a recorded `.evt21`/raw file.
+- **Shared streamer interface:** `Evt21Streamer` and `Evt21StreamerFromFile` must keep **identical interfaces** so either can feed the pipeline. The interface is `initialize(source, sensor_device)`, `start()`, `stop()`, `getBuffer()` → `evt21_buffer` (`uint64_t*`), `wordCount()`, `releaseBuffer()`. Only one buffer may be held at a time; it must be released before the next `getBuffer()`. A camera buffer is zero-copy mapped memory and is requeued on release. The file streamer returns `nullptr` at EOF.
 - **`addressEventCamera`** (`src/modules/addressEventCamera/`):
   - `evt21Decoder` holds every EVT2.1 bit layout constant. Keep new field extraction there rather than in the modules that use it. It provides `get_evt21_word_type`, `get_time_stamp`, `get_time_high` / `get_time_high_duration` (wrap-safe, 28-bit), `get_x` / `get_y` (`size_t`, for indexing), `get_valid_mask` and `is_valid_event`.
   - `histogram_buffer` / `histograms` are implemented: a ring of 5 per-pixel signed event histograms that hands out time-adjacent pairs for optic flow. Time surfaces don't exist yet. None of these files are in a CMake target yet.
@@ -70,7 +86,7 @@ Timestamps are in µs and 34 bits wide. `timestamp_us` is `uint32_t` and wraps a
 
 ## Conventions
 
-Error handling uses exceptions. Syscall failures throw `std::system_error` with errno, misuse throws `std::logic_error`, and bad data throws `std::runtime_error`. Each .cpp keeps its local helpers (`xioctl` retrying on EINTR, `fail`) in an anonymous namespace. Classes owning hardware are non-copyable and release resources in a `noexcept` `stop()` that the destructor also calls.
+Error handling uses exceptions. Syscall failures throw `std::system_error` with errno, misuse throws `std::logic_error`, and bad data throws `std::runtime_error`. V4L2 helpers shared across files live in `v4l2Util.h`; helpers used by only one .cpp stay in that file's anonymous namespace. Classes owning hardware are non-copyable and release resources in a `noexcept` `stop()` that the destructor also calls.
 
 ## Workflow
 

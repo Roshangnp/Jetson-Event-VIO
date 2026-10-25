@@ -28,15 +28,24 @@ public:
     // Wait for the next completed buffer returned by V4L2. Only wordCount()
     // words are valid. Release before getting another; the pointer is valid
     // until release or stop.
+    // Returns nullptr if no buffer arrives within cameraConfig::BUFFER_TIMEOUT_MS.
+    // The stream keeps running, so the caller can simply call getBuffer() again.
     evt21_buffer getBuffer();
     void releaseBuffer();
     std::size_t wordCount() const noexcept { return word_count_; }
 
 private:
+    // CLOSED -> INITIALIZED (initialize) -> STREAMING (start)
+    // STREAMING <-> HOLDING (getBuffer / releaseBuffer); stop() -> CLOSED
+    enum class State : std::uint8_t {
+        CLOSED,       // nothing open
+        INITIALIZED,  // driver open and mapped, not streaming
+        STREAMING,    // streaming, no buffer held by the caller
+        HOLDING       // streaming, caller holds buffer_index_
+    };
+
     Genx320Driver driver_;
-    bool initialized_ = false;
-    bool started_ = false;
-    bool buffer_in_use_ = false;
+    State state_ = State::CLOSED;
     std::uint32_t buffer_index_ = 0;
     std::size_t word_count_ = 0;
 };
