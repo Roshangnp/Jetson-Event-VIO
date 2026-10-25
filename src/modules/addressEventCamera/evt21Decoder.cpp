@@ -18,6 +18,15 @@ constexpr unsigned TIME_LOW_SHIFT = 54;
 constexpr evt21_word TIME_LOW_MASK = 0x3F;
 constexpr unsigned TIME_LOW_BITS = 6;
 
+constexpr unsigned X_SHIFT = 43;
+constexpr evt21_word X_MASK = 0x7FF;
+
+constexpr unsigned Y_SHIFT = 32;
+constexpr evt21_word Y_MASK = 0x7FF;
+
+constexpr evt21_word VALID_MASK = 0xFFFFFFFF;
+constexpr std::size_t VALID_BITS = 32;
+
 } // namespace
 
 evt21_type get_evt21_word_type(evt21_word word) {
@@ -30,4 +39,33 @@ timestamp_us get_time_stamp(evt21_word time_high_word, evt21_word time_low_word)
     // The full timestamp is 34 bits; timestamp_us keeps the low 32 and wraps
     // roughly every 71 minutes.
     return static_cast<timestamp_us>((high << TIME_LOW_BITS) | low);
+}
+
+std::size_t get_time_high(evt21_word time_high_word) {
+    return static_cast<std::size_t>((time_high_word >> TIME_HIGH_SHIFT) & TIME_HIGH_MASK);
+}
+
+std::size_t get_time_high_duration(std::size_t start, std::size_t current) {
+    // Masking the difference keeps it correct when the 28-bit counter wraps.
+    return (current - start) & TIME_HIGH_MASK;
+}
+
+std::size_t get_x(evt21_word word) {
+    return static_cast<std::size_t>((word >> X_SHIFT) & X_MASK);
+}
+
+std::size_t get_y(evt21_word word) {
+    return static_cast<std::size_t>((word >> Y_SHIFT) & Y_MASK);
+}
+
+std::uint32_t get_valid_mask(evt21_word word) {
+    return static_cast<std::uint32_t>(word & VALID_MASK);
+}
+
+bool is_valid_event(evt21_word word) {
+    const std::size_t x = get_x(word);
+    const std::size_t y = get_y(word);
+    return x % VALID_BITS == 0 &&
+           x + VALID_BITS <= cameraConfig::WIDTH &&
+           y < cameraConfig::HEIGHT;
 }

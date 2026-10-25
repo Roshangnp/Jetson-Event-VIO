@@ -15,16 +15,47 @@ class histograms{
 
     // recieves a evt21_buffer from evt21Streamer (of evt21Streamer_fromFile) and loops through
     // all valid words of the buffer and calls updateHistogram belonging to each histogram_buffer
-    // it also handles the resting of each buffer once the difference between timeHigh_start and timeHigh_current
-    // exeeds HISTOGRAM_TIME_HIGH_WIDTH. Once each each buffer is reset_() == true, the buffer is assigned a timeHigh_start
+    // it also handles the resetting of each buffer once the difference between timeHigh_start and timeHigh_current
+    // reaches HISTOGRAM_TIME_HIGH_WIDTH: the full buffer becomes READY, and the next buffer (from getNextQueuedIndex)
+    // is reset, assigned a timeHigh_start and sequence number, and becomes FILLING.
     void updateHistograms(evt21_buffer buffer, size_t word_count);
 
-    // returns the pointers to two adjacent histogram_buffers.
-    histogram_buffer_pair getReadyHistogramPair();
+    // returns the newest pair of time-adjacent ready histograms as {newer, older}, and holds
+    // both so they are not overwritten. Returns {nullptr, nullptr} if there is no pair newer
+    // than the last one returned, or if the newest buffer's predecessor was overwritten.
+    // Consecutive pairs may overlap: {C, B} can follow {B, A}. Call queueHistogramPair()
+    // before dequeuing again.
+    histogram_buffer_pair dequeueHistogramPair();
+
+    // re-queues the older of the dequeued pair so it can be written to. The newer one stays
+    // held because it is the older half of the next pair.
+    void queueHistogramPair();
+
+    // returns the number of corrupted event words skipped so far
+    size_t getBadWordCount() const { return bad_word_count_; }
 
     private:
-    evt21_word current_timeHigh;
+    // gives the index of the buffer to fill next: a FREE buffer if there is one, otherwise
+    // the oldest READY buffer. Never a FILLING or HELD buffer.
+    size_t getNextQueuedIndex();
+
+    // returns how many buffers are HELD by the consumer
+    size_t heldCount() const;
+
+    size_t bad_word_count_ = 0;
+    // decoded value (get_time_high) of the latest TIME_HIGH word
+    size_t current_timeHigh = 0;
+    // false until the first TIME_HIGH word; events before it have no time reference
+    bool has_timeHigh_ = false;
+    // the buffer currently being filled
+    size_t active_index_ = 0;
     histogram_buffer_array histogram_buffers_{};
-    size_t index1;
-    size_t index2;
+
+    // marks a search that found no buffer
+    static constexpr size_t NO_INDEX = HISTOGRAM_BUFFER_COUNT;
+
+    // sequence number given to the next window that starts
+    uint64_t next_sequence_ = 1;
+    // sequence of the newer buffer in the last pair returned, 0 if none yet
+    uint64_t last_dequeued_seq_ = 0;
 };
