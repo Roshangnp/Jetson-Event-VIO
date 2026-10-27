@@ -32,6 +32,8 @@ Reading histograms (pair protocol):
 
 dequeueHistogramPair() returns {newer, older}: the newest ready histogram and the one just before it in time. Both stay protected from being overwritten until released. It returns {nullptr, nullptr} if there is no pair newer than the last one returned, or if the older window has already been overwritten. The parent program never gets the same pair twice, but consecutive pairs overlap by one: {C, B} can follow {B, A}. If the parent program falls behind it gets the newest pair, skipping windows it missed; a buffer still HELD from the previous pair that is not part of the new one is released.
 
+dequeueNextHistogramPair() works the same way but returns pairs in order instead of skipping to the newest: the oldest ready window after the last pair returned, paired with its predecessor. One evt21 buffer can complete several windows, so to consume every window call it in a loop after each updateHistograms() (queueing each pair) until it returns {nullptr, nullptr}. This keeps up as long as one evt21 buffer completes at most 3 windows (5 buffers minus 1 FILLING and 1 HELD); beyond that the oldest ready windows are overwritten and it skips to the oldest pair still available. Use dequeueHistogramPair() when only the latest motion matters (optic flow) and dequeueNextHistogramPair() when every window matters (logging).
+
 When done with a pair, call queueHistogramPair(). This releases only the older buffer (HELD to FREE); the newer one stays HELD because it is the older half of the next pair. A pair must be queued before the next dequeueHistogramPair(), the same as releasing a streamer buffer.
 
 This is not thread safe yet. updateHistograms and the dequeue/queue calls must run on the same thread for now.

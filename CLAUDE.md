@@ -15,7 +15,7 @@ cmake -S tests/write_evt21_to_file -B build && cmake --build build
 ./build/write_evt21_to_file <video-device> <sensor-device>   # writes 1 s of raw EVT2.1 to ./log.raw
 ```
 
-`tests/histogram_buffer_writer` is a second CMake project: camera → `Evt21Streamer` → `histograms` → `writeHistograms`, logging the newer histogram of each pair to `./histogram_recording.bin` for 100 camera buffers:
+`tests/histogram_buffer_writer` is a second CMake project: camera → `Evt21Streamer` → `histograms` → `writeHistograms`, logging every window in order (via `dequeueNextHistogramPair()`) to `./histogram_recording.bin` for 100 camera buffers:
 
 ```
 cmake -S tests/histogram_buffer_writer -B build_hbw && cmake --build build_hbw
@@ -76,6 +76,7 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
   - `dequeueHistogramPair()` returns `{newer, older}` for the newest ready buffer N and its predecessor N−1.
   - It returns `{nullptr, nullptr}` if N isn't newer than the last pair handed out, or if N−1 was overwritten. So the consumer never gets the same pair twice, but consecutive pairs may overlap (`{C,B}` after `{B,A}`).
   - A consumer that falls behind gets the newest pair, skipping missed windows.
+  - `dequeueNextHistogramPair()` returns pairs in order instead: the oldest READY window after the last pair returned whose predecessor is still READY/HELD. Calling it in a loop (queuing after each pair) after every `updateHistograms` consumes every window, as long as one camera buffer completes at most 3 windows (`HISTOGRAM_BUFFER_COUNT` − 1 FILLING − 1 HELD). Beyond that the oldest READY windows are overwritten and it skips to the oldest pair left. Both dequeues share `last_dequeued_seq_` and may be mixed.
   - `queueHistogramPair()` releases only the older buffer. The newer one stays held as the next pair's older half.
   - Taking a new pair moves any HELD buffer that isn't part of it to FREE (the consumer fell behind). At most 3 buffers are ever unavailable (1 FILLING plus 2 HELD), so the writer always has a buffer.
   - Dequeuing twice without queuing, or queuing with nothing held, throws `std::logic_error`.

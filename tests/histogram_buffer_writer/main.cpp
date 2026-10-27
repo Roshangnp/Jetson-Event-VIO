@@ -28,6 +28,7 @@ int main(int argc, char* argv[]){
 
         streamer.start();
         writer.start();
+        bool first_pair = true;
         for (int i = 0; i<100; i++){
             evt21_buffer buffer = streamer.getBuffer();
             if (buffer == nullptr) {
@@ -38,14 +39,19 @@ int main(int argc, char* argv[]){
             hist.updateHistograms(buffer,word_count);
             streamer.releaseBuffer();
 
-            histograms::histogram_buffer_pair hist_pair = hist.dequeueHistogramPair();
-            if (hist_pair[0] == nullptr) {
-                // no new complete pair yet
-                continue;
+            // one camera buffer can complete several windows, so take every
+            // pair in order until none are left
+            for (histograms::histogram_buffer_pair hist_pair = hist.dequeueNextHistogramPair();
+                 hist_pair[0] != nullptr;
+                 hist_pair = hist.dequeueNextHistogramPair()) {
+                if (first_pair) {
+                    // the first pair's older window is never a newer half
+                    writer.tryWrite(*hist_pair[1]);
+                    first_pair = false;
+                }
+                writer.tryWrite(*hist_pair[0]);
+                hist.queueHistogramPair();
             }
-
-            writer.tryWrite(*hist_pair[0]);
-            hist.queueHistogramPair();
         }
 
         writer.stop();

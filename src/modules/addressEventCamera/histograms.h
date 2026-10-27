@@ -27,6 +27,13 @@ class histograms{
     // before dequeuing again.
     histogram_buffer_pair dequeueHistogramPair();
 
+    // like dequeueHistogramPair(), but returns pairs in order instead of skipping to the newest:
+    // the oldest ready pair whose newer window comes after the last one returned. If the next
+    // window was already overwritten, it skips to the oldest pair still available. Call it in a
+    // loop (with queueHistogramPair() after each pair) until it returns {nullptr, nullptr} to
+    // consume every window. Both dequeue functions share state and may be mixed.
+    histogram_buffer_pair dequeueNextHistogramPair();
+
     // re-queues the older of the dequeued pair so it can be written to. The newer one stays
     // held because it is the older half of the next pair.
     void queueHistogramPair();
@@ -41,6 +48,13 @@ class histograms{
 
     // returns how many buffers are HELD by the consumer
     size_t heldCount() const;
+
+    // returns the index of the READY or HELD buffer with this sequence, or NO_INDEX
+    size_t findCompleteBySequence(uint64_t sequence) const;
+
+    // holds newer and older, releases any other HELD buffer, and records newer as the
+    // last pair returned
+    histogram_buffer_pair holdPair(size_t newer, size_t older);
 
     size_t bad_word_count_ = 0;
     // decoded value (get_time_high) of the latest TIME_HIGH word

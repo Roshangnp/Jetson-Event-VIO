@@ -109,21 +109,57 @@ histograms::histogram_buffer_pair histograms::dequeueHistogramPair() {
 
     // The window just before it, READY or still HELD from the last pair, if it
     // has not been overwritten.
-    const uint64_t newer_seq = histogram_buffers_[newer].getSequence();
+    const size_t older = findCompleteBySequence(histogram_buffers_[newer].getSequence() - 1);
+    if (older == NO_INDEX) {
+        return {nullptr, nullptr};
+    }
+    return holdPair(newer, older);
+}
+
+histograms::histogram_buffer_pair histograms::dequeueNextHistogramPair() {
+    if (heldCount() == 2) {
+        throw std::logic_error("queue the current histogram pair first");
+    }
+
+    // The oldest READY window after the last pair whose predecessor is still
+    // available. Normally that is last_dequeued_seq_ + 1, paired with the buffer
+    // still HELD from the last pair; if that window was overwritten, this skips
+    // to the oldest pair that remains.
+    size_t newer = NO_INDEX;
     size_t older = NO_INDEX;
+    for (size_t i = 0; i < HISTOGRAM_BUFFER_COUNT; ++i) {
+        const histogram_buffer& candidate = histogram_buffers_[i];
+        const uint64_t sequence = candidate.getSequence();
+        if (candidate.getState() != buffer_state::READY ||
+            sequence <= last_dequeued_seq_ ||
+            (newer != NO_INDEX && sequence > histogram_buffers_[newer].getSequence())) {
+            continue;
+        }
+        const size_t predecessor = findCompleteBySequence(sequence - 1);
+        if (predecessor != NO_INDEX) {
+            newer = i;
+            older = predecessor;
+        }
+    }
+    if (newer == NO_INDEX) {
+        return {nullptr, nullptr};
+    }
+    return holdPair(newer, older);
+}
+
+size_t histograms::findCompleteBySequence(uint64_t sequence) const {
     for (size_t i = 0; i < HISTOGRAM_BUFFER_COUNT; ++i) {
         const histogram_buffer& candidate = histogram_buffers_[i];
         const buffer_state state = candidate.getState();
         if ((state == buffer_state::READY || state == buffer_state::HELD) &&
-            candidate.getSequence() == newer_seq - 1) {
-            older = i;
-            break;
+            candidate.getSequence() == sequence) {
+            return i;
         }
     }
-    if (older == NO_INDEX) {
-        return {nullptr, nullptr};
-    }
+    return NO_INDEX;
+}
 
+histograms::histogram_buffer_pair histograms::holdPair(size_t newer, size_t older) {
     // A buffer still held from the last pair that is not part of this one was
     // skipped because the consumer fell behind; release it.
     for (size_t i = 0; i < HISTOGRAM_BUFFER_COUNT; ++i) {
@@ -134,7 +170,7 @@ histograms::histogram_buffer_pair histograms::dequeueHistogramPair() {
 
     histogram_buffers_[newer].setState(buffer_state::HELD);
     histogram_buffers_[older].setState(buffer_state::HELD);
-    last_dequeued_seq_ = newer_seq;
+    last_dequeued_seq_ = histogram_buffers_[newer].getSequence();
     return {&histogram_buffers_[newer], &histogram_buffers_[older]};
 }
 
