@@ -8,14 +8,21 @@ Visual-inertial odometry for a Jetson Orin NX using a Prophesee GenX320 event ca
 
 ## Build
 
-There is no top-level build. The only CMake project is the capture test (`.vscode/settings.json` points CMake Tools at it):
+There is no top-level build. Each test is its own CMake project. The capture test (`.vscode/settings.json` points CMake Tools at it):
 
 ```
 cmake -S tests/write_evt21_to_file -B build && cmake --build build
 ./build/write_evt21_to_file <video-device> <sensor-device>   # writes 1 s of raw EVT2.1 to ./log.raw
 ```
 
-It builds with C++17 and `-Wall -Wextra -Wpedantic`. Running it needs the GenX320 V4L2 driver on the Jetson.
+`tests/histogram_buffer_writer` is a second CMake project: camera → `Evt21Streamer` → `histograms` → `writeHistograms`, logging the newer histogram of each pair to `./histogram_recording.bin` for 100 camera buffers:
+
+```
+cmake -S tests/histogram_buffer_writer -B build_hbw && cmake --build build_hbw
+./build_hbw/histogram_buffer_writer <video-device> <sensor-device>
+```
+
+Both build with C++17 and `-Wall -Wextra -Wpedantic`. Running it needs the GenX320 V4L2 driver on the Jetson.
 
 Modules include `types.h` / `config.h` by bare name, so compiling them needs `-Iinclude -Iconfig`. To check a single file builds:
 
@@ -50,6 +57,8 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
 - **`addressEventCamera`** (`src/modules/addressEventCamera/`):
   - `evt21Decoder` holds every EVT2.1 bit layout constant. Keep new field extraction there rather than in the modules that use it. It provides `get_evt21_word_type`, `get_time_stamp`, `get_time_high` / `get_time_high_duration` (wrap-safe, 28-bit), `get_x` / `get_y` (`size_t`, for indexing), `get_valid_mask` and `is_valid_event`.
   - `histogram_buffer` / `histograms` are implemented: a ring of 5 per-pixel signed event histograms that hands out time-adjacent pairs for optic flow. Time surfaces don't exist yet. None of these files are in a CMake target yet.
+
+- **`fileWriter`** (`src/modules/fileWriter/`): `writeHistograms` logs histograms (`uint64_t` TIME_HIGH start + raw 320×320 `int16_t`, fixed-size records, no file header) from a background thread. `tryWrite()` copies into a preallocated 32-slot ring and returns `false` (counting a drop) when full, never blocking the pipeline. Only the ring is shared between threads, so the pipeline stays single-threaded. Linking it needs `-pthread`.
 
 ### Histogram memory design
 

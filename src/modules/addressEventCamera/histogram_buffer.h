@@ -49,6 +49,9 @@ class histogram_buffer{
     // sets timeHigh_current_, called on each TIME_HIGH word
     void setTimeHighCurrent(size_t time_high);
 
+    // returns timeHigh_start_, the decoded TIME_HIGH the window began at
+    size_t getTimeHighStart() const { return timeHigh_start_; }
+
     // sets sequence_, called by histograms when the buffer begins a new window
     void setSequence(uint64_t sequence) { sequence_ = sequence; }
 
