@@ -4,141 +4,152 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Visual-inertial odometry for a Jetson Orin NX using a Prophesee GenX320 event camera (320×320). The goal is to estimate velocity from ego-motion in the event stream and send it to a PX4 flight controller. The camera input path, the EVT2.1 decoder, the event histograms and a threaded histogram file logger exist so far, and the camera → histograms path has been validated on hardware (see Hardware findings). Optic flow has started: its types (`include/flow_types.h`) and the histogram filter interface (`src/modules/opticFlow/histogram_filters.h`) are declared but not implemented. Time surfaces, the Lucas-Kanade solve, IMU fusion and the PX4 link are unimplemented.
+Visual-inertial odometry for a Jetson Orin NX 16 GB (ARK carrier "Super", JetPack 6 / L4T R36.5, Ubuntu 22.04) using a Prophesee GenX320 event camera (320×320). The goal is to estimate velocity from ego-motion in the event stream and send it to a PX4 flight controller.
+
+Working so far, validated on hardware: camera → `Evt21Streamer` → event histograms → dense Lucas-Kanade optic flow (CPU and CUDA) → threaded flow/histogram file loggers. The GPU pipeline keeps up with the camera in real time (see Hardware findings). Not started: time surfaces, IMU fusion, the PX4 link. Not implemented inside the flow pipeline: the Hessian-ridge filter (method 2), Gaussian-derivative spatial derivatives, and a CPU version of the Gaussian smoothing.
 
 ## Build
 
-There is no top-level build. Each test is its own CMake project. The capture test (`.vscode/settings.json` points CMake Tools at it):
+There is no top-level build. Each test is its own CMake project, built in a `build/` folder inside the test directory (`mkdir build && cd build && cmake .. && cmake --build .`). The user wants to keep the CMake projects separate. All three default to `CMAKE_BUILD_TYPE=Release`: with no build type CMake passes **no `-O` flag at all**, and every build before Oct 28 2026 ran unoptimized (histogramming 3–5 ms instead of ~0.1 ms, flow copies 28 ms instead of 0.3 ms). C++17 with `-Wall -Wextra -Wpedantic`; builds should have no warnings.
+
+| Test | Pipeline | Output |
+|---|---|---|
+| `tests/write_evt21_to_file` | `Genx320Driver` directly, 1 s capture | `./log.raw` (raw EVT2.1) |
+| `tests/histogram_buffer_writer` | camera → `Evt21Streamer` → `histograms` → `writeHistograms`, every window in order for 100 buffers (also writes the first pair's older half) | `./histogram_recording.bin` |
+| `tests/optic_flow_writer` | camera → `Evt21Streamer` → `histograms` → `optic_flow` (GPU by default) → `writeFlows` + `writeHistograms` | `./flow_recording.bin`, `./histogram_recording.bin`, timing report on stdout |
+
+`.vscode/settings.json` points CMake Tools at `write_evt21_to_file`, so the editor shows include errors in the opticFlow headers; they build fine. Leave it unless asked.
+
+### `optic_flow_writer`
 
 ```
-cmake -S tests/write_evt21_to_file -B build && cmake --build build
-./build/write_evt21_to_file <video-device> <sensor-device>   # writes 1 s of raw EVT2.1 to ./log.raw
+./optic_flow_writer <video-device> <sensor-device> [gpu|cpu]     # on the Jetson: /dev/video0 /dev/v4l-subdev3
+sudo ./optic_flow_writer /dev/video0 /dev/v4l-subdev3            # switches to MAXN_SUPER and pins clocks for the run
 ```
 
-`tests/histogram_buffer_writer` is a second CMake project: camera → `Evt21Streamer` → `histograms` → `writeHistograms`, logging every window in order (via `dequeueNextHistogramPair()`) to `./histogram_recording.bin` for 100 camera buffers. On the first pair it also writes the older half, so window 1 is logged. It prints the written, dropped and bad-word counts at the end:
+- Runs the whole pipeline for `WARMUP_TIME` (3 s: past the startup burst/blackout and the ~70 ms first GPU call) without logging, prints `logging started`, then records `RECORD_BUFFER_COUNT` (500) camera buffers. A timed-out `getBuffer()` counts toward the 500.
+- Logs every `LOG_EVERY_N`-th (4) flow and its histogram pair (older then newer): ~1.56 MB per logged window, ~610 / N MB/s at ~390 windows/s. The Jetson NVMe sustains ~712 MB/s, so N = 1 is too close; 2–3 is the practical minimum. 500 buffers is ~0.5 s of camera time in a dense scene, ~5.5 s in a static one (~850 MB of files).
+- Prints a summary line (flows, mean flow time, warm-up flows, written/dropped counts) and an instrumentation report: wall vs camera time, driver drops, TIME_HIGH jumps / missing ticks, and per camera buffer mean/p50/p95/max of waiting in `getBuffer`, histograms + release, flow, logging, busy time, plus the count of buffers that took longer than the camera time they cover, all repeated for high-event-rate buffers (< 3 ms of camera time). The report is only on stdout, not in the files: ask the user to paste it.
+- `max_performance` (in `main.cpp`): with root, stores the clock settings (`jetson_clocks --store` to a per-run `/tmp/optic_flow_writer_clocks_<pid>.conf`, because `--store` refuses to overwrite a file), switches to the power mode named `MAXN_SUPER` (ID looked up from `nvpmodel -p --verbose`, `< /dev/null` so a reboot prompt answers no), runs `jetson_clocks`, and on exit switches the mode back, restores, and deletes the file. Without root it warns and runs on the governor's clocks. Ctrl-C skips the restore, and the power mode persists across reboots. Files written under sudo are owned by root.
+- `gpu` needs `optic_flow::gaussian_smoothing` (default true); `cpu` throws while smoothing is on, since smoothing has no CPU version yet.
 
-```
-cmake -S tests/histogram_buffer_writer -B build_hbw && cmake --build build_hbw
-./build_hbw/histogram_buffer_writer <video-device> <sensor-device>
-```
+CMake for this test: `project(... LANGUAGES CXX CUDA)`, `CMAKE_CUDA_ARCHITECTURES` defaults to 87 (Orin), Eigen as `SYSTEM` include, `EIGEN_MPL2_ONLY`, CUDA flags `--expt-relaxed-constexpr -diag-suppress=20012` (20012 is Eigen's harmless `__host__ __device__` warning), links `Threads::Threads` and `CUDA::cudart`. If no CUDA compiler is given and none is on `PATH`, it uses `/usr/local/cuda/bin/nvcc` (JetPack doesn't put nvcc on PATH). A `build/` folder from a configure that failed for lack of a compiler must be deleted (it caches empty compiler features).
 
-On the Jetson the tests are usually built in a `build/` folder inside the test directory (`cmake .. && cmake --build .`), so the recording lands in `tests/histogram_buffer_writer/build/histogram_recording.bin`. There is no `.gitignore` yet, so build folders and recordings get staged by `git add -A`.
+**Desktop (RTX 5070 Ti, sm_120, glibc 2.43, GCC 15):** the `nvcc` on PATH is CUDA 12.5, which can't target sm_120, and CUDA 13.1's headers clash with glibc 2.43 (`rsqrt`/`rsqrtf` declared twice). Configure with
+`cmake .. -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=120 -DGLIBC_243_WORKAROUND=ON`. The workaround (`-Xcompiler=-U_GNU_SOURCE -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=700`) must be set before `project()`, because CMake's own compiler check already fails without it. Hand nvcc builds need the same flags. The Jetson (glibc 2.35) needs none of this.
 
-Both build with C++17 and `-Wall -Wextra -Wpedantic`. Running either test needs the GenX320 V4L2 driver on the Jetson.
+**Jetson CUDA:** only `cuda-toolkit-12-6` is installed (from NVIDIA's Jetson apt repo, `--no-install-recommends`; no cuDNN/TensorRT/VPI/OpenCV/`nvidia-jetpack`), in `/usr/local/cuda-12.6` → `/usr/local/cuda`. nvcc is not on PATH.
 
-Modules include `types.h` / `config.h` by bare name, so compiling them needs `-Iinclude -Iconfig`. To check a single file builds:
+### Single files
+
+Modules include `types.h` / `config.h` by bare name: `-Iinclude -Iconfig`. Flow code also needs `-isystem external/eigen -DEIGEN_MPL2_ONLY`, plus `-Isrc/modules/addressEventCamera -Isrc/modules/opticFlow`; CUDA headers (`*_cuda.h`, `cudaUtil.h`) need `-Isrc/drivers/cuda -isystem /usr/local/cuda/include` under g++.
 
 ```
 g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude -Iconfig -c src/modules/addressEventCamera/evt21Decoder.cpp
 ```
 
-Anything including `flow_types.h` or the opticFlow headers also needs Eigen: `-isystem external/eigen -DEIGEN_MPL2_ONLY`, or in CMake `target_include_directories(<target> SYSTEM PRIVATE ../../external/eigen)` plus `target_compile_definitions(<target> PRIVATE EIGEN_MPL2_ONLY)`. `SYSTEM`/`-isystem` keeps `-Wall -Wextra -Wpedantic` quiet about Eigen's own headers. No CMake target uses Eigen yet.
+The driver, `Evt21Streamer` and the capture test include `<linux/videodev2.h>`, so they only compile on Linux.
 
-There is no test framework or linter.
-
-The driver, `Evt21Streamer` and the capture test include `<linux/videodev2.h>`, so they only compile on Linux (the Jetson). On macOS they can be syntax-checked against a minimal stub `linux/videodev2.h` passed with `-isystem`, but that does not check them against real V4L2.
+There is no test framework or linter. Verification so far has been ad hoc harnesses (synthetic moving Gaussian blob with known flow, CPU-vs-GPU comparison, ASan/UBSan runs, recorded-histogram replays), built outside the repo.
 
 ## Architecture
 
-Data flows driver → streamer → addressEventCamera (decoder, histograms, time surfaces) → future optic-flow / VIO.
+Data flows driver → streamer → addressEventCamera (decoder, histograms) → opticFlow (filters, derivatives, LK; CPU or CUDA) → fileWriter / future VIO.
 
 - **`Genx320Driver`** (`src/drivers/genx320/`) is raw V4L2:
   - The EVT-format control (`0x00982903`, value 1 = EVT2.1) is set on the **sensor subdevice**. That fd stays open for the session because some drivers reset controls on close.
-  - The MMAP streaming queue lives on the **video device**, opened `O_NONBLOCK`. 8 buffers are requested, but the driver may grant a different count, so code must use `bufferCount()`. A grant of 0 fails in `initialize()`.
+  - The MMAP streaming queue lives on the **video device**, opened `O_NONBLOCK`. 8 buffers are requested, but the driver may grant a different count, so code must use `bufferCount()`. A grant of 0 fails in `initialize()`. Each buffer is 32,768 bytes (1024 × 32 "Bayer" format) = 4,096 EVT2.1 words.
   - `initialize()` calls `stop()` first, so it is safe to call twice.
   - It exposes `fd()`, `buffer(index)` (throws `std::out_of_range`) and `bufferCount()`, and leaves DQBUF/QBUF to its owner.
-- **`v4l2Util.h`** (`src/drivers/genx320/`, namespace `v4l2_util`) holds the header-only V4L2 helpers shared by the driver, the streamer and the capture test: `xioctl` (retries on EINTR), `fail` (throws `std::system_error` with errno), `makeBuffer(index)` (an MMAP capture `v4l2_buffer`) and `queueBuffer(fd, index)`. Use these rather than writing new copies.
+- **`v4l2Util.h`** (`src/drivers/genx320/`, namespace `v4l2_util`) holds the header-only V4L2 helpers shared by the driver, the streamer and the capture test: `xioctl` (retries on EINTR), `fail` (throws `std::system_error` with errno), `makeBuffer(index)` and `queueBuffer(fd, index)`. Use these rather than writing new copies.
+- **`cudaUtil.h`** (`src/drivers/cuda/`, namespace `cuda_util`): `check(cudaError_t, what)` throws `std::runtime_error` with `cudaGetErrorString`. The CUDA counterpart of `v4l2Util.h`.
 - **`Evt21Streamer`** owns the driver and does DQBUF/QBUF:
-  - Its lifecycle is a private `State` enum: `CLOSED` → `INITIALIZED` → `STREAMING` ⇄ `HOLDING`, and `stop()` returns it to `CLOSED`.
-  - `getBuffer()` tries `VIDIOC_DQBUF` first and only calls `poll()` on `EAGAIN`, so a buffer that is already waiting costs no poll syscall.
-  - The whole `getBuffer()` call has one deadline, `cameraConfig::BUFFER_TIMEOUT_MS` (500 ms, in `config/config.h`). If no buffer arrives in time it returns `nullptr` with nothing held and the stream still running, so the caller just calls it again. From the camera streamer, `nullptr` means "no data yet"; from the file streamer, it means EOF.
-  - Empty buffers are requeued and skipped.
-  - A buffer with the error flag, or a bad size, is requeued and reported as `std::runtime_error`. Requeue failures are ignored there so the original error is reported, and the stream keeps running.
-  - An out-of-range buffer index stops the stream.
-- The capture test (`tests/write_evt21_to_file`) drives `Genx320Driver` directly rather than `Evt21Streamer`, with its own 1 s capture deadline. It could now be moved onto `Evt21Streamer`, since `getBuffer()` times out.
-- `Evt21StreamerFromFile` replays a recorded `.evt21`/raw file.
-- **Shared streamer interface:** `Evt21Streamer` and `Evt21StreamerFromFile` must keep **identical interfaces** so either can feed the pipeline. The interface is `initialize(source, sensor_device)`, `start()`, `stop()`, `getBuffer()` → `evt21_buffer` (`uint64_t*`), `wordCount()`, `releaseBuffer()`. Only one buffer may be held at a time; it must be released before the next `getBuffer()`. A camera buffer is zero-copy mapped memory and is requeued on release. The file streamer returns `nullptr` at EOF.
+  - Lifecycle: private `State` enum `CLOSED` → `INITIALIZED` → `STREAMING` ⇄ `HOLDING`; `stop()` returns it to `CLOSED`. `HOLDING` means the caller holds the copy, not a V4L2 buffer.
+  - **Cached copy:** the driver's mmap'd buffers are uncached (reading 4,096 words one by one takes ~520 µs; `memcpy` takes ~33 µs). `getBuffer()` copies `bytesused` into `copy_` (a `std::vector` sized once in `initialize()` to the largest buffer), requeues the V4L2 buffer immediately, and returns `copy_.data()`. `releaseBuffer()` does no ioctl. Histogramming a buffer went from ~1.15 ms to ~0.12 ms.
+  - `getBuffer()` tries `VIDIOC_DQBUF` first and only calls `poll()` on `EAGAIN`. The whole call has one deadline, `cameraConfig::BUFFER_TIMEOUT_MS` (500 ms); on timeout it returns `nullptr` with the stream still running. Empty buffers are requeued and skipped. A buffer with the error flag or a bad size is requeued and reported as `std::runtime_error`. An out-of-range index stops the stream.
+  - `droppedBufferCount()`: gaps in the V4L2 sequence numbers of every dequeued buffer (empty ones included) since `start()`. **The GenX320 driver loses data without sequence gaps**, so missing TIME_HIGH ticks (the `optic_flow_writer` report) are the reliable loss signal.
+- The capture test drives `Genx320Driver` directly with its own 1 s deadline. It could move onto `Evt21Streamer`.
+- `Evt21StreamerFromFile` replays a recorded raw EVT2.1 file (32 KB chunks into its own array).
+- **Shared streamer interface:** `Evt21Streamer` and `Evt21StreamerFromFile` must keep **identical interfaces**: `initialize(source, sensor_device)`, `start()`, `stop()`, `getBuffer()` → `evt21_buffer` (`uint64_t*`), `wordCount()`, `releaseBuffer()`, `droppedBufferCount()` (always 0 for the file). One buffer at a time; release before the next `getBuffer()`. Both hand out a copy now. The file streamer returns `nullptr` at EOF.
 - **`addressEventCamera`** (`src/modules/addressEventCamera/`):
-  - `evt21Decoder` holds every EVT2.1 bit layout constant. Keep new field extraction there rather than in the modules that use it. It provides `get_evt21_word_type`, `get_time_stamp`, `get_time_high` / `get_time_high_duration` (wrap-safe, 28-bit), `get_x` / `get_y` (`size_t`, for indexing), `get_valid_mask` and `is_valid_event`.
-  - `histogram_buffer` / `histograms` are implemented: a ring of 5 per-pixel signed event histograms that hands out time-adjacent pairs for optic flow. Their tunables, `HISTOGRAM_BUFFER_COUNT` (5) and `HISTOGRAM_TIME_HIGH_WIDTH` (40), are `static constexpr` members in `histograms.h`, not in `config.h`. Time surfaces aren't built yet: only the `time_surface` type exists in `types.h`, as a raw `timestamp_us[PIXEL_NUM]` C array; make it a `std::array` like `histogram_array` before using it. The histogram files are built only by the `histogram_buffer_writer` test. `histogram_buffer` exposes `getTimeHighStart()` (decoded TIME_HIGH the window began at) for logging.
-
-- **`fileWriter`** (`src/modules/fileWriter/`): `writeHistograms` logs histograms (`uint64_t` TIME_HIGH start + raw 320×320 `int16_t`, fixed-size records, no file header) from a background thread. `tryWrite()` copies into a preallocated 32-slot ring and returns `false` (counting a drop) when full, never blocking the pipeline. Only the ring is shared between threads, so the pipeline stays single-threaded. Linking it needs `-pthread` (`Threads::Threads` in CMake). `tryWrite()` throws `std::logic_error` if the buffer isn't READY/HELD or the writer isn't started, and rethrows a disk error from the writer thread. `stop()` drains the ring, joins, `fdatasync`s and closes. The ring (32 × 204,808 B ≈ 6.5 MB) is allocated once and kept across `stop()`/`initialize()`. The file-only `fail()`/`writeAll()` helpers live in its anonymous namespace, not `v4l2Util.h`, because that header pulls in `<linux/videodev2.h>`.
-  - Log every window once: consecutive pairs overlap, so write only `newer` of each pair (plus `older` of the first). Read a recording with `np.fromfile(path, dtype=[('t','<u8'),('hist','<i2',(320,320))])`; consecutive `t` should differ by exactly 40.
-  - Full logging is about 80 MB/s (≈390 windows/s × 204,808 B), so record to NVMe, never tmpfs.
-
-- **Eigen** (`external/eigen`) is Eigen 3.4.0, headers only, vendored so neither machine needs a system install; `external/eigen/VERSION` records the source URL and sha256. Use only fixed-size Eigen types (`Vector2f`, `Matrix2f`, …), never `MatrixXf`/`VectorXf`, and `float` rather than `double` (NEON fp32). Keep Eigen out of `types.h` and `config.h` so modules that don't use flow don't depend on it. Eigen types aren't `constexpr`, so compile-time constants such as kernels are `std::array`.
+  - `evt21Decoder` holds every EVT2.1 bit layout constant. Keep new field extraction there. It provides `get_evt21_word_type`, `get_time_stamp`, `get_time_high` / `get_time_high_duration` (wrap-safe, 28-bit), `get_x` / `get_y` (`size_t`), `get_valid_mask` and `is_valid_event`.
+  - `histogram_buffer` / `histograms`: a ring of `HISTOGRAM_BUFFER_COUNT` (12) per-pixel signed event histograms that hands out time-adjacent pairs. `HISTOGRAM_BUFFER_COUNT` and `HISTOGRAM_TIME_HIGH_WIDTH` (40) are `static constexpr` members in `histograms.h`, not in `config.h`. Time surfaces don't exist: only a `time_surface` type in `types.h` (a raw C array; make it a `std::array` before using it). `histogram_buffer::getTimeHighStart()` gives the decoded TIME_HIGH a window began at.
+- **`fileWriter`** (`src/modules/fileWriter/`, README has both file formats and numpy dtypes). Both writers log from a background thread: `tryWrite()` copies into a preallocated ring and returns `false` (counting a drop) when full, never blocking the pipeline. Only the ring is shared between threads. `stop()` drains, joins, `fdatasync`s and closes. Rings are allocated once and kept across `stop()`/`initialize()`. They need `-pthread`. The file-only `fail()`/`writeAll()` helpers live in each .cpp's anonymous namespace, not `v4l2Util.h` (that header pulls in `<linux/videodev2.h>`).
+  - `writeHistograms`: 32 slots of `uint64_t` TIME_HIGH start + raw 320×320 `int16_t` (204,808 B). `tryWrite(histogram_buffer&)` throws `std::logic_error` unless the buffer is READY/HELD and the writer started. Read with `np.fromfile(path, dtype=[('t','<u8'),('hist','<i2',(320,320))])`. To log every window once, write only `newer` of each pair (plus `older` of the first).
+  - `writeFlows`: 8 slots (~9.2 MB) of `flow_record { uint64_t time_high; flow_field flow; }`, written straight from memory, padding included (`static_assert`s in `writeFlows.h` fail the build if the layout changes). `tryWrite(const flow_field&, const size_t& time_high)`, with `optic_flow::getTimeHigh()`. Record = 24 + GRID² × 12 bytes (1,153,224 at 11×11). Record offsets: `t` 0, `t_start` 8, `t_end` 16, patches 24; patch = `float flow[2]` at 0, `bool valid` at 8, 12 B.
+- **Eigen** (`external/eigen`): Eigen 3.4.0 headers only, vendored; `external/eigen/VERSION` has the URL and sha256. Use only fixed-size types and `float`. Keep Eigen out of `types.h` and `config.h`. Eigen types aren't `constexpr`, so compile-time constants (kernels) are `std::array`. Fixed-size Eigen types work in CUDA device code (with `--expt-relaxed-constexpr`), so device arrays have the host layout and copy back with a plain `memcpy`.
 - **Flow types** (`include/flow_types.h`):
-  - `vector2d` (`Eigen::Vector2f`) is flow in pixels per second, image frame (x right, y down). `eigenValues2d` / `eigenVectors2d` hold the structure tensor's eigen decomposition.
-  - `flow_patch` is one grid point's result (flow, eigenvalues, eigenvectors, `valid`). It is 48 B and 16-byte aligned because of the `Matrix2f`.
-  - `flow_field` is the TIME_HIGH start/end plus one `flow_patch` per grid point, row-major. Dense with 3×3 patches it's ≈4.85 MB, so the `histograms` storage rule applies: static storage or a single `make_unique`, never the stack.
-  - `grid_mask` is `std::bitset<GRID_POINT_NUM>`, one bit per grid point (≈12.6 KB dense), always passed by reference.
-  - `grid_to_pixel(grid_index)` gives a patch centre's pixel coordinate along one axis.
-- **Flow grid** (`flowConfig` in `config.h`): `PATCH_WIDTH` (odd, currently 3) and `GRID_STRIDE` (pixel distance between patch centres; 1 = dense) define the grid, and patches overlap when the stride is below the width. `GRID_WIDTH` / `GRID_HEIGHT` / `GRID_POINT_NUM` are derived and keep only centres whose whole patch fits on the sensor, so there is no edge padding (dense 3×3 → 318×318, dense 5×5 → 316×316). 5×5 over a ~2.5 ms window is verified in event-dense scenes. Functions index by `grid_index`, not pixel index; the two only coincide at stride 1. `HISTOGRAM_MIN_THRESH` (2) is method 1's cutoff.
-- **Filter constants** (`filters` in `config.h`): Gaussian sigma (placeholder value) and width, Savitzky-Golay (SGF) width, and the 3×3 SGF kernels as `filters::kernel3x3` (`std::array<float, 9>`, row-major, index = row·3 + col, row = y). Use float literals (`1.0f/6`); `1/6` is integer division and evaluates to 0.
-- **`opticFlow`** (`src/modules/opticFlow/`), namespace `histogram_filters` in `histogram_filters.h`. These are standalone functions taking `const histogram_array&`, kept separate from the Lucas-Kanade solve, which will get its own header:
-  - **Mask pipeline:** `getValidHistMask_method1` (threshold on histogram magnitude) and `getValidHistMask_method2` (Hessian ridge condition) take a `grid_mask&` and return `void`. Each only considers bits already set and clears the ones it rejects, so filters chain: `mask.set()`, then apply them in any order.
-  - **Derivatives at a `grid_index`:** `applySGF_XY` / `applySGF_T` (Savitzky-Golay), `applyGuassianConvolution_firstOrder` (alternative to `applySGF_XY`) and `applyGuassianConvolution_secondOrder` (for method 2's Hessian).
-  - **Naming vs. physics:** a histogram value is already the intensity change over the window, so `applySGF_T` needs only one histogram (it smooths the change), and the "spatial derivative of the histogram" is physically a mixed space-time derivative of intensity. The naming is known to be loose; leave it unless asked.
-  - Callers get the histogram as `*buffer->getHistogram()` after checking it's non-null.
+  - `vector2d` (`Eigen::Vector2f`): flow in px/s, image frame (x right, y down). `Structure_Matrix` (`Matrix2f`, A'A), `Time_Grad_Matrix` (`Vector2f`, A'b), `Hessian_Matrix` (`Matrix2f`). `eigenValues2d` / `eigenVectors2d` are defined but unused.
+  - `enum class spatial_derivative { SGF, GAUSSIAN }` and `enum class hist_filter { NONE, MIN_MAGNITUDE, HESSIAN_RIDGE }`.
+  - `flow_patch { vector2d flow; bool valid; }` (12 B). The eigenvalues/eigenvectors were removed as unused.
+  - `flow_field`: `time_high_start` (older window start), `time_high_end` (newer window end), one `flow_patch` per grid point, row-major (~1.15 MB at 11×11). Static storage or one `make_unique`, never the stack.
+  - `grid_mask` = `std::bitset<GRID_POINT_NUM>` (CPU only; `std::bitset` can't be used in device code). Indexed by grid point.
+  - Per-pixel arrays (row-major, `pixel_index = y * WIDTH + x`): `Hxy_array` (`vector2d` per pixel, ~800 KB), `Ht_array` (second-order temporal derivative, ~400 KB), `smoothed_histogram_array` (float). `Structure_Matrix_array` / `Time_Grad_Matrix_array` per grid point. `LK_row_sums_array`: separable patch-sum scratch, `LK_PRODUCT_NUM` (5) planes × HEIGHT × GRID_WIDTH (~2 MB).
+  - `grid_to_pixel(grid_index)`: a patch centre's pixel coordinate along one axis.
+- **Flow config** (`flowConfig` in `config.h`): `PATCH_WIDTH` 11 (odd), `GRID_STRIDE` 1 (dense), so the grid is 310×310; grid centres keep `PATCH_RADIUS` from the edge, no padding. `SHI_TOMPSI_MIN_THRESH` 1.0 (must stay > 0: 0 lets empty patches with det = 0 through as NaN flow). `HISTOGRAM_MIN_THRESH` 5 is method 1's cutoff; per-pixel window values are mostly ±1, so 5 is far too high if the filter is ever enabled (1–2). The filter stride equals the LK stride, so masks are per grid point.
+- **Filter constants** (`filters` in `config.h`): `GUASSIAN_SMOOTHING_SIGMA` 1.0 / `GUASSIAN_SMOOTHING_RADIUS` 3 (7×7, cut at 3σ), the 3×3 SGF kernels as `filters::kernel3x3` (`std::array<float, 9>`, row-major, row = y), and placeholder `GUASSIAN_SIGMA` / `GUASSIAN_PATCH_WIDTH`. Use float literals (`1.0f/6`); `1/6` is integer division.
+- **`opticFlow`** (`src/modules/opticFlow/`): CPU functions in namespaces, CUDA versions in `*_cuda` namespaces (`*_cuda.h` + `.cu`) taking device pointers and a `cudaStream_t` (asynchronous; launch errors throw `std::runtime_error`, kernel errors surface at the next sync). On the device the mask is one `uint8_t` per grid point (1 = valid); `cudaMemsetAsync(mask, 1, …)` is `mask.set()`. Unimplemented functions throw `std::logic_error("… is not implemented")`.
+  - `histogram_filters` (CPU) / `histogram_filters_cuda`: `getValidHistMask_method1` (clears grid points whose centre pixel is within ±`HISTOGRAM_MIN_THRESH`), `getValidHistMask_method2` (stub). Filters take a mask, only look at set bits and clear rejects, so they chain. `histogram_filters_helpers::applyGuassianConvolution_secondOrder(hist, grid_index)` and `applyHessianRidgeCondition` are stubs. `histogram_filters_cuda::applyGuassianSmoothing(d_hist, d_smoothed)`: normalised 7×7 Gaussian, replicate edges (GPU only).
+  - `lucas_kanade` (CPU) runs in passes: `getHxy_array(hist, hxy, spatial_derivative)` (SGF; GAUSSIAN throws), `getHt_array(newer, older, ht)` (`(SGF_HT * newer − SGF_HT * older) / window length`), `getLKMatrix_arrays(hxy, ht, row_sums, structure, time_grad, mask)` (separable: a row pass into `row_sums`, then a column pass per grid point, so 2 × PATCH_WIDTH terms instead of PATCH_WIDTH²; masked points zeroed), `LK_method(structure, time_grad, flow, mask)` (smaller eigenvalue in closed form, Shi-Tomasi test clears failing mask bits and marks them invalid, then the closed-form solve of A'A v = −A'b). Pixel helpers in `lucas_kanade_helpers`: `applySGF_XY` / `applySGF_T(hist, pixel_index)`, `applyShiTompsiCondition`; `applyGuassianConvolution_firstOrder` and `getStructureMatrix_GuassianConvolution` (declared only) are unimplemented. Derivative edge reads use replicate padding (clamped).
+  - `lucas_kanade_cuda` mirrors the CPU passes (`getHxy_array` / `getHt_array` have overloads for raw `histogram_array` and `smoothed_histogram_array` input; `getLKMatrix_arrays` takes a device `LK_row_sums_array` scratch). One thread per pixel for derivatives, per (row, grid column) for the row pass, per grid point for the column pass and LK.
+  - **`optic_flow`** (`optic_flow.h/.cpp`): directs a histogram pair through the pipeline and owns every array (~6.7 MB; static storage or one `make_unique`). Settings: `spacial_derivitive_type` (SGF), `filter_type` (`hist_filter::NONE`), `gaussian_smoothing` (true; GPU only). `run_LK_method_CPU(pair)` / `run_LK_method_GPU(pair)` return `const flow_field&`; both throw `std::logic_error` unless both histograms are READY/HELD, set `time_high_` (newer start + 40) and the flow span. Both are synchronous: the pair can be queued as soon as they return. `getTimeHigh()`. `stop()` frees the GPU buffers (destructor calls it). GPU buffers (`gpu_buffers`, defined only in the .cpp so the header needs no CUDA) are allocated on the first GPU call (~70–100 ms with CUDA context creation) and kept. **Integrated GPU (Jetson):** `flow_` is `cudaHostRegister`ed and mapped, and LK writes it in place (the Orin reports `canUseHostPointerForRegisteredMem = 0`, so it uses `cudaHostGetDevicePointer`). **Discrete GPU (desktop):** device copy, copied back after the run. GPU sequence: copy pair → mask set → filter → smooth ×2 → Hxy → Ht → row/column sums → LK → (discrete: copy back) → sync.
+  - Naming vs. physics: a histogram value is already the intensity change over the window, so `applySGF_T` needs one histogram, and "spatial derivatives of the histogram" are mixed space-time derivatives of intensity. Known to be loose; leave it unless asked.
 
-### Current goal: optic flow pipeline
-
-This is the target the user is working to (also in `README.md`). Design new flow code to fit it:
+### Optic flow pipeline (the user's target, also in README.md)
 
 ```
-histogram_pair -> filter -> spatial + temporal derivative convolution on valid pixels -> LK on valid pixels
+histogram_pair -> filter -> spatial + temporal derivative convolution -> LK on valid grid points
 ```
 
-- **filter** (produces the `grid_mask` of valid grid points), one of:
-  - second-order Gaussian convolution with the Hessian ridge criterion (`getValidHistMask_method2`)
-  - minimum magnitude threshold (`getValidHistMask_method1`)
-  - nothing: `mask.set()`, so the next step processes every pixel
-- **spatial derivative convolution** on the newer histogram: SGF (`applySGF_XY`) or first-order Gaussian (`applyGuassianConvolution_firstOrder`).
-- **temporal derivative convolution** (`applySGF_T`) on both histograms. Their difference over Δt is the second-order temporal derivative (Rueckauer & Delbruck 2016, eq. 5; histogram values are already intensity changes, so the spatial derivatives are mixed space-time derivatives).
-- **LK**: per valid grid point, sum the structure matrix and right-hand side over the `PATCH_WIDTH` patch (eq. 2) and solve the 2×2 system in closed form, keeping the eigenvalues for confidence.
-- **Each step can be a CUDA kernel or a CPU process.** Keep the stages interchangeable: each consumes the pair and/or the previous stage's outputs plus the mask and writes its own outputs, so either implementation can be swapped in per stage. Moving data between CPU and GPU between stages costs a transfer (≈58 µs per 800 KB over the desktop's PCIe, much cheaper on the Orin's shared memory), so consecutive GPU stages should keep their data on the device. `std::bitset` can't be used in device code, so the GPU side needs its own mask layout (e.g. `uint8_t` per grid point or packed `uint32_t` words); not decided yet.
-
-**Benchmark (Oct 2026, desktop RTX 5070 Ti, not yet run on the Orin):** dense 3×3 SGF derivatives + LK over a full pair is ≈18.8 MFLOP per frame (≈7.3 GFLOP/s at 390 windows/s). On the GPU both kernels take ≈11 µs; the pair can be requeued once it's copied (≈38 µs), and flow is back on the CPU after ≈110 µs, dominated by PCIe copies. The same algorithm, unoptimized on one CPU core, takes ≈1.5 ms. On the GPU, the pair must stay HELD until its copy (or, with zero-copy, the kernel) completes before `queueHistogramPair()`.
+- filter: Hessian ridge (method 2, not implemented), minimum magnitude (method 1), or nothing.
+- spatial derivatives: SGF (implemented) or first-order Gaussian (not implemented). Gaussian *smoothing* of both histograms before the SGF derivatives is implemented on the GPU.
+- temporal: SGF_HT on both histograms; their difference over Δt is the second-order temporal derivative (Rueckauer & Delbruck 2016, eq. 5).
+- LK: structure matrix and A'b summed over the patch (eq. 2), 2×2 closed-form solve, Shi-Tomasi on the smaller eigenvalue.
+- Each step can be a CUDA kernel or a CPU process; consecutive GPU stages keep data on the device.
 
 ### Histogram memory design
 
-- Each `histogram_buffer` holds its `histogram_array` inline (`std::array<int16_t, 320*320>`, ~200 KB) and allocates nothing. Each pixel holds a signed sum over the window: a positive event adds 1 and a negative event subtracts 1. `int16_t` (±32767) can't overflow within a ~2.5 ms window. `histograms` holds its 5 buffers by value in a `std::array`, so one `histograms` object is a single contiguous ~1 MB block. Don't turn these members into pointers or per-buffer heap allocations, because the count and size are compile-time constants and the buffers live exactly as long as their manager.
-- `histogram_buffer` is non-copyable, which makes `histograms` non-copyable too. This prevents accidental 200 KB / 1 MB copies.
-- Exactly one `histograms` instance is created by whatever owns the pipeline. Put it in static storage (namespace scope, or a member of a statically stored owner) or create it with a single `std::make_unique` at startup. Never make it a stack local, since 1 MB is too much for the stack, especially on threads. Don't use `static` data members inside the class. Buffer addresses stay fixed for the whole run, so consumers can take a `histograms&` or the `histogram_buffer*` pair from `dequeueHistogramPair()`.
-- Each histogram covers `HISTOGRAM_TIME_HIGH_WIDTH = 40` TIME_HIGH ticks, at 64 µs per tick, which is ≈2.56 ms. Buffers are reused, never reallocated: `resetHistogram()` zeroes `hist_` in place.
+- Each `histogram_buffer` holds its `histogram_array` inline (`std::array<int16_t, 320*320>`, ~200 KB) and allocates nothing. Each pixel holds a signed sum over the window (+1 positive, −1 negative event); `int16_t` can't overflow within a window. `histograms` holds its 12 buffers by value in a `std::array` (~2.4 MB contiguous). Don't turn these into pointers or per-buffer heap allocations.
+- `histogram_buffer` is non-copyable, so `histograms` is too.
+- Exactly one `histograms` instance per pipeline, in static storage or a single `std::make_unique`; never a stack local. Don't use `static` data members inside the class. Buffer addresses stay fixed for the whole run.
+- Each window covers `HISTOGRAM_TIME_HIGH_WIDTH = 40` TIME_HIGH ticks × 64 µs ≈ 2.56 ms. `resetHistogram()` zeroes in place.
 
 ### Histogram filling and hand-off
 
-- **Windows:** `updateHistograms(buffer, word_count)` keeps its state between calls, so a window can span streamer buffers. Events before the first TIME_HIGH are dropped. When the active window reaches the width, it becomes READY, and `getNextQueuedIndex()` (private) picks the next buffer: a FREE one if there is one, otherwise the oldest READY one, never FILLING or HELD. That buffer is reset, starts at the same tick, and becomes FILLING, so windows have no gaps. TIME_HIGH values are stored decoded (`size_t`), never as raw words.
-- **Buffer state:** each `histogram_buffer` has exactly one `buffer_state`: `FREE`, `FILLING`, `READY` or `HELD`. The enum is defined in `histogram_buffer.h`. Only `histograms` changes states; the buffer just stores it (`getState` / `setState`). There is always exactly one FILLING buffer (`active_index_`, kept as a fast path) once the first TIME_HIGH arrives, and at most 2 HELD. `getHistogram()` returns non-null only for READY / HELD. The state is a plain enum for now; it is meant to become `std::atomic<buffer_state>` when the consumer moves to its own thread (release store on FILLING→READY; compare-exchange on READY→HELD vs READY→FILLING).
-- **Sequence numbers:** every window gets a `sequence_` from `next_sequence_`, starting at 1, so consecutive windows have consecutive numbers. Ring indexes say nothing about time order, so pairing uses sequence numbers, not indexes.
+- **Windows:** `updateHistograms(buffer, word_count)` keeps state between calls, so a window can span streamer buffers. Events before the first TIME_HIGH are dropped. A full window becomes READY and `getNextQueuedIndex()` picks the next buffer (a FREE one, else the oldest READY, never FILLING or HELD); it is reset and starts at the same tick, so windows have no gaps. A TIME_HIGH jump inside a window (missing data) makes that window longer than 40 ticks.
+- **Buffer state:** exactly one `buffer_state` each (`FREE`, `FILLING`, `READY`, `HELD`, enum in `histogram_buffer.h`); only `histograms` changes it. One FILLING once the first TIME_HIGH arrives, at most 2 HELD. `getHistogram()` is non-null only for READY / HELD. Plain enum for now; meant to become `std::atomic<buffer_state>` when the consumer moves to its own thread.
+- **Sequence numbers:** every window gets a consecutive `sequence_` starting at 1; pairing uses sequences, not ring indexes.
 - **Pair protocol:**
-  - `dequeueHistogramPair()` returns `{newer, older}` for the newest ready buffer N and its predecessor N−1.
-  - It returns `{nullptr, nullptr}` if N isn't newer than the last pair handed out, or if N−1 was overwritten. So the consumer never gets the same pair twice, but consecutive pairs may overlap (`{C,B}` after `{B,A}`).
-  - A consumer that falls behind gets the newest pair, skipping missed windows.
-  - `dequeueNextHistogramPair()` returns pairs in order instead: the oldest READY window after the last pair returned whose predecessor is still READY/HELD. Calling it in a loop (queuing after each pair) after every `updateHistograms` consumes every window, as long as one camera buffer completes at most 3 windows (`HISTOGRAM_BUFFER_COUNT` − 1 FILLING − 1 HELD). Beyond that the oldest READY windows are overwritten and it skips to the oldest pair left. Both dequeues share `last_dequeued_seq_` and may be mixed.
-  - `queueHistogramPair()` releases only the older buffer. The newer one stays held as the next pair's older half.
-  - Taking a new pair moves any HELD buffer that isn't part of it to FREE (the consumer fell behind). At most 3 buffers are ever unavailable (1 FILLING plus 2 HELD), so the writer always has a buffer.
-  - Dequeuing twice without queuing, or queuing with nothing held, throws `std::logic_error`.
-- **Bad words:** POS/NEG words failing `is_valid_event` (misaligned x, or off the sensor) are skipped and counted in `getBadWordCount()` rather than stopping the stream. `histogram_buffer::updateHistogram` still throws on them as a safety net, so the check currently runs twice per word.
-- **Still open:** it isn't thread-safe. `updateHistograms` and dequeue/queue must run on the same thread until the state becomes atomic. Making `dequeueHistogramPair()` lock-free also needs a back-out if the older buffer is reused between taking the newer and the older one.
+  - `dequeueHistogramPair()` returns `{newer, older}` for the newest ready buffer and its predecessor, or `{nullptr, nullptr}` if there's nothing newer than the last pair or the predecessor was overwritten. Consecutive pairs may overlap. A consumer that falls behind skips to the newest pair.
+  - `dequeueNextHistogramPair()` returns pairs in order. Called in a loop after every `updateHistograms` it consumes every window as long as one camera buffer completes at most `HISTOGRAM_BUFFER_COUNT − 2` (10) windows; beyond that the oldest READY windows are overwritten. Both dequeues share `last_dequeued_seq_`.
+  - `queueHistogramPair()` releases only the older buffer; the newer stays held as the next pair's older half. Taking a new pair frees any other HELD buffer. Dequeuing twice without queuing, or queuing with nothing held, throws `std::logic_error`.
+- **Bad words:** POS/NEG words failing `is_valid_event` are skipped and counted (`getBadWordCount()`); `histogram_buffer::updateHistogram` still throws on them as a safety net.
+- Not thread-safe: `updateHistograms` and dequeue/queue must run on one thread.
 
-### Hardware findings (GenX320 on the Jetson, Oct 2026)
+### Hardware findings (GenX320 + Orin NX, Oct 2026)
 
-- **Startup blackout:** about 200–220 ms of TIME_HIGH goes missing a few windows (≈30 ms) after STREAMON. It is a camera kernel driver quirk at startup, not a pipeline bug, and appeared in both recordings.
-- **Startup burst:** the first window after STREAMON had ~55,900 active pixels (over half the sensor) versus a median of ~790 for the rest of a quiet scene. Discard every window up to the end of the blackout (≈250 ms after STREAMON) before optic flow or analysis.
-- **Windows per camera buffer:** in a low-event-rate scene each V4L2 buffer held 5–8 ms of events, i.e. 2–3 windows. Quiet scenes make buffers span more time, which is what makes newest-only `dequeueHistogramPair()` skip windows. With in-order `dequeueNextHistogramPair()` a 100-buffer recording (≈850 ms) gave 255 records with every gap exactly 40 ticks apart except the startup blackout. 3 windows per buffer is the limit at `HISTOGRAM_BUFFER_COUNT = 5`; it needs to be at least windows per buffer + 2, so raise it (e.g. to 8, +600 KB) if quieter scenes exceed that.
-- Per-pixel window values seen so far range from −4 to +8.
+- **Startup:** about 200–220 ms of TIME_HIGH goes missing ≈30 ms after STREAMON (a driver quirk), and the first window has a burst of ~55,900 active pixels. `optic_flow_writer` skips the first 3 s; other pipelines should discard the first ~250 ms.
+- **Windows per camera buffer** (4,096 words; sparse events cost ~1 word each, plus 40 TIME_HIGH words per window): static scene ~4–7 windows (~11–18 ms of camera time), hand at the edge ~2.3, fast hand wave across the middle (9,500–11,200 events per window) ~0.4 (~1 ms). So a fixed buffer count records very different durations.
+- **Clocks decide whether the pipeline keeps up.** Unpinned, `schedutil` keeps the CPU at 729 MHz and the GPU at its 305 MHz minimum even while busy (the load is bursty), and 18–40% of camera time was lost. The board defaults to the 40W power mode (ID 4: CPU ≤ 1.5 GHz, GPU ≤ 1173 MHz); MAXN_SUPER (ID 0) lifts the CPU to 1.98 GHz, and the GPU hardware maximum is 1173 MHz in both. Modes 0 and 4 have the same online cores and power gating, so switching needs no reboot. The `jetson` user has no passwordless sudo.
+- **Data loss shows up as TIME_HIGH jumps between buffers with no V4L2 sequence gaps**, exactly in buffers whose processing outlasted the camera time they cover: the driver drops data when the pipeline is behind.
+- **Measured (sudo, Release, static scene):** GPU flow ≈ 400–480 µs per window (copy pair 62, mask 8, smooth ×2 92, Hxy 15, Ht 20, patch sums 120, LK solve + mapped write 85 µs); histograms + release ~0.1 ms per buffer; logging ~0.3 ms per logged window; busy ~2.3 ms per ~11 ms buffer; 0% camera time lost. With the hand at the edge: ~1.0 ms busy per 5.9 ms buffer (~18%). The dense-wave case (< 1 window per buffer) is estimated at ~20–25% load but not yet measured. CPU flow (no smoothing) ≈ 7.9 ms per window on one core: not real time.
+- **LK tuning (offline, numpy copy of the pipeline that reproduces the Jetson's output exactly):** on a hand wave, 3×3 patches gave incoherent directions (33% within 45° of the hand's motion); 11×11 on σ 1 smoothed histograms with Shi-Tomasi 1 gave (−5, 219) px/s against a measured (38, 237), 81% within 45°, and no off-hand vectors. Without smoothing, large patches get the direction but underestimate speed (~60%). Single isolated events produce quantized axis-aligned flow artifacts (±260 / ±521 px/s at 3×3); hot pixels recur at (65, 314), (47, 31) and (105, 130).
+- **Fast motion:** at ~2.9 px per 2.56 ms window (≈1,130 px/s), LK underestimates speed (~37% at σ 1, 11×11) and only ~50% of vectors are within 45°. Larger scales recover the speed (σ 4 / 19×19 ≈ 82%, half resolution ≈ 77%) but not the direction. Options if it matters: coarse-to-fine (pyramid) LK, shorter windows (`HISTOGRAM_TIME_HIGH_WIDTH` 20), larger fixed scale. The user is focused on the computation pipeline rather than LK accuracy for now.
+- Jetson NVMe sustains ~712 MB/s writes. `scp` of a 310 MB recording took ~4 s on the current network.
 
 ### Open items
 
-- Discard the startup burst/blackout windows in the pipeline.
-- Possibly raise `HISTOGRAM_BUFFER_COUNT` (see above).
-- Implement `histogram_filters` and the Lucas-Kanade solve, and give the opticFlow module a CMake target with Eigen.
-- Spelling: `GUASSIAN` / `KERNAL` in `config.h` and `Guassian` in the `histogram_filters` function names.
-- Time surfaces, IMU fusion and the PX4 link.
-- Move the capture test onto `Evt21Streamer`; it also doesn't check `V4L2_BUF_FLAG_ERROR`.
-- Nits: `Evt21StreamerFromFile::start()` reports "initialize the file before starting it" when it is already started; `evt21Streamer/README.md` misspells `genx320Drvier`.
+- CPU Gaussian smoothing; Hessian-ridge filter (method 2) and Gaussian-derivative spatial derivatives.
+- Measure the dense-scene (< 1 window per buffer) timing report.
+- Possible GPU speedups: CUDA Graph for the 9 launches, separable smoothing (49 → 14 taps), overlapping the GPU with camera reading (async launch, sync before queuing the pair).
+- Real-time policy for control: flow on the newest pair only (`dequeueHistogramPair()`); doesn't help when a buffer holds ≤ 1 window.
+- Record for a fixed time instead of a fixed buffer count; optionally write the timing report to a file next to the recordings.
+- Grid margin: patches at the outermost grid points use edge-clamped derivatives; widening the margin by the SGF radius would avoid it.
+- Hot-pixel mask; startup burst/blackout discard in the pipeline.
+- Spelling: `GUASSIAN` / `KERNAL` / `Guassian` / `SHI_TOMPSI` / `Tompsi` throughout; the user hasn't asked to rename yet.
+- Time surfaces, IMU fusion, PX4 link.
+- Move the capture test onto `Evt21Streamer` (it also doesn't check `V4L2_BUF_FLAG_ERROR`).
+- Nits: `Evt21StreamerFromFile::start()` reports "initialize the file before starting it" when already started; `evt21Streamer/README.md` misspells `genx320Drvier`.
 - Add a `.gitignore` for build folders and `.bin`/`.raw` recordings.
 
 Each module directory has a README stating its intended contract. Read it before changing a module.
@@ -147,17 +158,19 @@ Each module directory has a README stating its intended contract. Read it before
 
 The camera produces 64-bit little-endian words. Bits [63:60] hold the type:
 - `0x0` NEG / `0x1` POS: [59:54] timestamp LSBs, [53:43] x (aligned to 32), [42:32] y, [31:0] valid mask for pixels x..x+31.
-- `0x8` TIME_HIGH: [59:32] timestamp bits 33..6, so one TIME_HIGH tick is 64 µs.
+- `0x8` TIME_HIGH: [59:32] timestamp bits 33..6, so one TIME_HIGH tick is 64 µs. They arrive every tick, so a jump of more than one tick means missing data.
 - Also `0xA` EXT_TRIGGER, `0xE` OTHERS, `0xF` CONTINUED. These are not in the `evt21_type` enum (`config/config.h`), so switches over it need a default case.
 
 Timestamps are in µs and 34 bits wide. `timestamp_us` is `uint32_t` and wraps after about 71 minutes.
 
 ## Conventions
 
-Error handling uses exceptions. Syscall failures throw `std::system_error` with errno, misuse throws `std::logic_error`, and bad data throws `std::runtime_error`. V4L2 helpers shared across files live in `v4l2Util.h`; helpers used by only one .cpp stay in that file's anonymous namespace. Classes owning hardware are non-copyable and release resources in a `noexcept` `stop()` that the destructor also calls.
+Error handling uses exceptions. Syscall failures throw `std::system_error` with errno, misuse throws `std::logic_error`, bad data and CUDA errors throw `std::runtime_error`. Shared helpers live in `v4l2Util.h` / `cudaUtil.h`; helpers used by only one file stay in its anonymous namespace. Classes owning hardware (including GPU memory) are non-copyable and release resources in a `noexcept` `stop()` that the destructor also calls. Large arrays (histograms, flow fields, derivative images) live in static storage or a single `make_unique`, never on the stack.
 
 ## Workflow
 
-Roshan Patel is currently the only contributor. "Push this" means stage everything, untracked files included (`git add -A`), commit, and push the current branch with `git push origin HEAD`. Commit straight to whatever branch is checked out (currently `streamline-driver-streamer`).
+Roshan Patel is currently the only contributor. "Push this" means stage everything, untracked files included (`git add -A`), commit, and push the current branch with `git push origin HEAD` (currently `streamline-driver-streamer`). Check `git status` first for build folders and recordings (there is no `.gitignore`), and always before saying something is or isn't committed.
 
-Code reaches the Jetson only through git: commit and push here, then `git pull` on the Jetson (repo at `~/Jetson-Event-VIO`, reachable over SSH as `jetson@jetson.local`). Recordings come back the other way with `scp`. Over Wi-Fi a 50 MB recording takes more than a minute, so use a long timeout. Always check `git status` before saying something is or isn't committed.
+Code reaches the Jetson only through git: commit and push here, then `git pull` on the Jetson (`~/Jetson-Event-VIO`, SSH `jetson@jetson.local`; the user gives the login when needed, and it must never be written into the repo). Recordings come back with `scp`. When testing uncommitted code on the Jetson, copy the tree to `/tmp` (e.g. `tar` over SSH) and build there, so the user's checkout and recordings stay untouched; run anything that writes files from that copy, and clean it up afterwards (sudo runs leave root-owned files). Don't change the Jetson's system settings (packages, power mode, sudoers) without asking.
+
+`~/Desktop/flow_playback` (outside the repo, its own `.venv` with numpy and matplotlib) has `play_flow.py`, which plays a `flow_recording.bin`: speed colour map plus arrows, grid size inferred from the file size, `--fps`, `--save out.gif`, space / ←→ to pause and step.
