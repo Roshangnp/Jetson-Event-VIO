@@ -25,16 +25,17 @@
 static histograms hist;
 static optic_flow flow;
 
-// log every Nth flow_field and the histogram pair it came from: one flow_field is ~1.15 MB, so
-// logging every window (~390/s) would be ~450 MB/s
-constexpr size_t LOG_EVERY_N = 20;
+// log every Nth flow_field and the histogram pair it came from: ~1.56 MB per logged window (1.15 MB
+// flow_field + 2 x 0.2 MB histograms), so ~610 / N MB/s at ~390 windows/s. The Jetson's NVMe sustains
+// ~710 MB/s, so 4 (~150 MB/s) leaves plenty of margin; the summary's dropped counts show if it doesn't.
+constexpr size_t LOG_EVERY_N = 4;
 
 // the pipeline runs this long without logging before recording starts, so the startup burst and
 // blackout (~250 ms) and the first GPU call (CUDA setup, ~70 ms) are over
 constexpr auto WARMUP_TIME = std::chrono::seconds(3);
 
 // camera buffers recorded once the warm-up is over
-constexpr int RECORD_BUFFER_COUNT = 100;
+constexpr int RECORD_BUFFER_COUNT = 500;
 
 namespace {
 
