@@ -10,6 +10,16 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()
 
+# JetPack installs CUDA in /usr/local/cuda without putting nvcc on PATH, so fall back to it when no
+# compiler is given. A build folder from a configure that already failed here still has incomplete
+# compiler detection cached, so delete it once (rm -rf build) rather than reconfiguring it.
+if(NOT CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
+    find_program(NVCC_ON_PATH nvcc)
+    if(NOT NVCC_ON_PATH AND EXISTS /usr/local/cuda/bin/nvcc)
+        set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc CACHE FILEPATH "CUDA compiler" FORCE)
+    endif()
+endif()
+
 # Set before project(): CMake's own CUDA compiler check already fails without it.
 option(GLIBC_243_WORKAROUND "CUDA 13.1 headers clash with glibc 2.43's rsqrt/rsqrtf declarations" OFF)
 if(GLIBC_243_WORKAROUND)
