@@ -6,6 +6,12 @@ cmake_minimum_required(VERSION 3.18)
 # Desktop (RTX 5070 Ti): needs CUDA 12.8+ for sm_120, and the glibc 2.43 workaround:
 #   cmake .. -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=120 -DGLIBC_243_WORKAROUND=ON
 
+# Without a build type CMake passes no -O flag, so host code (Eigen, std::array accesses, the histogram
+# and flow copies) ran unoptimized: several times slower on the Jetson.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()

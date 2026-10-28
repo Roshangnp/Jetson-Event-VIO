@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <string>
 
@@ -33,6 +34,9 @@ public:
     evt21_buffer getBuffer();
     void releaseBuffer();
     std::size_t wordCount() const noexcept { return word_count_; }
+
+    // always 0: a file never drops buffers. Matches Evt21Streamer's interface.
+    std::uint64_t droppedBufferCount() const noexcept { return 0; }
 
 private:
     static constexpr std::size_t kBufferBytes = 1024 * 32;

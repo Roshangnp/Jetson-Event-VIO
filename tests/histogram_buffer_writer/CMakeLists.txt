@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.10)
 
+# Without a build type CMake passes no -O flag, so the code runs unoptimized (several times slower on
+# the Jetson).
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 project(histogram_buffer_writer LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
