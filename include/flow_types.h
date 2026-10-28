@@ -23,6 +23,10 @@ using Time_Grad_Matrix = Eigen::Vector2f; // represents A'b in LK equation
 // A'A and A'b are built from the same derivatives, so one choice covers both.
 enum class spatial_derivative { SGF, GAUSSIAN };
 
+// which mask filter runs before LK: none (every grid point), method 1 (minimum histogram magnitude) or
+// method 2 (Hessian ridge)
+enum class hist_filter { NONE, MIN_MAGNITUDE, HESSIAN_RIDGE };
+
 // one bit per grid point, indexed by grid_index (row-major). A set bit marks a grid point
 // still worth running LK on. ~12.6 KB at a dense 3x3 grid, so pass it by reference.
 using grid_mask = std::bitset<flowConfig::GRID_POINT_NUM>;
@@ -38,7 +42,7 @@ struct flow_patch {
 // One flow estimate per grid point, row-major. Dense 5x5 is ~1.6 MB, so like histograms it
 // must live in static storage or a single std::make_unique, never on the stack.
 struct flow_field {
-    // TIME_HIGH span the flow was measured over (older window start -> newer window start)
+    // TIME_HIGH span the flow was measured over (older window start -> newer window end)
     uint64_t time_high_start;
     uint64_t time_high_end;
     std::array<flow_patch, flowConfig::GRID_POINT_NUM> patches;
