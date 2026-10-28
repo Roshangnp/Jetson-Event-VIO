@@ -25,7 +25,8 @@ namespace flowConfig
     // GRID_STRIDE = 1 is dense flow. 5x5 over a ~2.5 ms window is verified in event-dense scenes.
     inline constexpr size_t PATCH_WIDTH = 3;
     inline constexpr size_t GRID_STRIDE = 1;
-    inline constexpr uint8_t HISTOGRAM_MIN_THRESH = 2;
+    inline constexpr uint8_t HISTOGRAM_MIN_THRESH = 5;
+    inline constexpr float SHI_TOMPSI_MIN_THRESH = 1;
 
     static_assert(PATCH_WIDTH % 2 == 1, "PATCH_WIDTH must be odd so the patch has a centre pixel");
     static_assert(GRID_STRIDE >= 1, "GRID_STRIDE must be at least 1");

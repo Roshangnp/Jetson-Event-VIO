@@ -81,6 +81,25 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
   - **Naming vs. physics:** a histogram value is already the intensity change over the window, so `applySGF_T` needs only one histogram (it smooths the change), and the "spatial derivative of the histogram" is physically a mixed space-time derivative of intensity. The naming is known to be loose; leave it unless asked.
   - Callers get the histogram as `*buffer->getHistogram()` after checking it's non-null.
 
+### Current goal: optic flow pipeline
+
+This is the target the user is working to (also in `README.md`). Design new flow code to fit it:
+
+```
+histogram_pair -> filter -> spatial + temporal derivative convolution on valid pixels -> LK on valid pixels
+```
+
+- **filter** (produces the `grid_mask` of valid grid points), one of:
+  - second-order Gaussian convolution with the Hessian ridge criterion (`getValidHistMask_method2`)
+  - minimum magnitude threshold (`getValidHistMask_method1`)
+  - nothing: `mask.set()`, so the next step processes every pixel
+- **spatial derivative convolution** on the newer histogram: SGF (`applySGF_XY`) or first-order Gaussian (`applyGuassianConvolution_firstOrder`).
+- **temporal derivative convolution** (`applySGF_T`) on both histograms. Their difference over Δt is the second-order temporal derivative (Rueckauer & Delbruck 2016, eq. 5; histogram values are already intensity changes, so the spatial derivatives are mixed space-time derivatives).
+- **LK**: per valid grid point, sum the structure matrix and right-hand side over the `PATCH_WIDTH` patch (eq. 2) and solve the 2×2 system in closed form, keeping the eigenvalues for confidence.
+- **Each step can be a CUDA kernel or a CPU process.** Keep the stages interchangeable: each consumes the pair and/or the previous stage's outputs plus the mask and writes its own outputs, so either implementation can be swapped in per stage. Moving data between CPU and GPU between stages costs a transfer (≈58 µs per 800 KB over the desktop's PCIe, much cheaper on the Orin's shared memory), so consecutive GPU stages should keep their data on the device. `std::bitset` can't be used in device code, so the GPU side needs its own mask layout (e.g. `uint8_t` per grid point or packed `uint32_t` words); not decided yet.
+
+**Benchmark (Oct 2026, desktop RTX 5070 Ti, not yet run on the Orin):** dense 3×3 SGF derivatives + LK over a full pair is ≈18.8 MFLOP per frame (≈7.3 GFLOP/s at 390 windows/s). On the GPU both kernels take ≈11 µs; the pair can be requeued once it's copied (≈38 µs), and flow is back on the CPU after ≈110 µs, dominated by PCIe copies. The same algorithm, unoptimized on one CPU core, takes ≈1.5 ms. On the GPU, the pair must stay HELD until its copy (or, with zero-copy, the kernel) completes before `queueHistogramPair()`.
+
 ### Histogram memory design
 
 - Each `histogram_buffer` holds its `histogram_array` inline (`std::array<int16_t, 320*320>`, ~200 KB) and allocates nothing. Each pixel holds a signed sum over the window: a positive event adds 1 and a negative event subtracts 1. `int16_t` (±32767) can't overflow within a ~2.5 ms window. `histograms` holds its 5 buffers by value in a `std::array`, so one `histograms` object is a single contiguous ~1 MB block. Don't turn these members into pointers or per-buffer heap allocations, because the count and size are compile-time constants and the buffers live exactly as long as their manager.
