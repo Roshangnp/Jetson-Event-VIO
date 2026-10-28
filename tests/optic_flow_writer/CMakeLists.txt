@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-# camera -> Evt21Streamer -> histograms -> optic_flow (CPU or CUDA) -> writeFlows
+# camera -> Evt21Streamer -> histograms -> optic_flow (CPU or CUDA) -> writeFlows (+ writeHistograms)
 #
 # Jetson (Orin, sm_87):  cmake .. && cmake --build .
 # Desktop (RTX 5070 Ti): needs CUDA 12.8+ for sm_120, and the glibc 2.43 workaround:
@@ -44,6 +44,7 @@ add_executable(optic_flow_writer
     ../../src/modules/opticFlow/lucas_kanade.cu
     ../../src/modules/opticFlow/optic_flow.cpp
     ../../src/modules/fileWriter/writeFlows.cpp
+    ../../src/modules/fileWriter/writeHistograms.cpp
 )
 
 target_include_directories(optic_flow_writer PRIVATE

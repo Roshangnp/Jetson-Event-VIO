@@ -26,7 +26,7 @@ namespace flowConfig
     inline constexpr size_t PATCH_WIDTH = 3;
     inline constexpr size_t GRID_STRIDE = 1;
     inline constexpr uint8_t HISTOGRAM_MIN_THRESH = 5;
-    inline constexpr float SHI_TOMPSI_MIN_THRESH = 1;
+    inline constexpr float SHI_TOMPSI_MIN_THRESH = 1e-6f; // effectively 0; exactly 0 would let empty patches (det = 0) through as NaN flow
 
     static_assert(PATCH_WIDTH % 2 == 1, "PATCH_WIDTH must be odd so the patch has a centre pixel");
     static_assert(GRID_STRIDE >= 1, "GRID_STRIDE must be at least 1");
