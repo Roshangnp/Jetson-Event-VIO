@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Visual-inertial odometry for a Jetson Orin NX using a Prophesee GenX320 event camera (320×320). The goal is to estimate velocity from ego-motion in the event stream and send it to a PX4 flight controller. The camera input path, the EVT2.1 decoder and the event histograms exist so far. Time surfaces, optic flow, IMU fusion and the PX4 link are unimplemented.
+Visual-inertial odometry for a Jetson Orin NX using a Prophesee GenX320 event camera (320×320). The goal is to estimate velocity from ego-motion in the event stream and send it to a PX4 flight controller. The camera input path, the EVT2.1 decoder, the event histograms and a threaded histogram file logger exist so far, and the camera → histograms path has been validated on hardware (see Hardware findings). Time surfaces, optic flow, IMU fusion and the PX4 link are unimplemented.
 
 ## Build
 
@@ -15,14 +15,16 @@ cmake -S tests/write_evt21_to_file -B build && cmake --build build
 ./build/write_evt21_to_file <video-device> <sensor-device>   # writes 1 s of raw EVT2.1 to ./log.raw
 ```
 
-`tests/histogram_buffer_writer` is a second CMake project: camera → `Evt21Streamer` → `histograms` → `writeHistograms`, logging every window in order (via `dequeueNextHistogramPair()`) to `./histogram_recording.bin` for 100 camera buffers:
+`tests/histogram_buffer_writer` is a second CMake project: camera → `Evt21Streamer` → `histograms` → `writeHistograms`, logging every window in order (via `dequeueNextHistogramPair()`) to `./histogram_recording.bin` for 100 camera buffers. On the first pair it also writes the older half, so window 1 is logged. It prints the written, dropped and bad-word counts at the end:
 
 ```
 cmake -S tests/histogram_buffer_writer -B build_hbw && cmake --build build_hbw
 ./build_hbw/histogram_buffer_writer <video-device> <sensor-device>
 ```
 
-Both build with C++17 and `-Wall -Wextra -Wpedantic`. Running it needs the GenX320 V4L2 driver on the Jetson.
+On the Jetson the tests are usually built in a `build/` folder inside the test directory (`cmake .. && cmake --build .`), so the recording lands in `tests/histogram_buffer_writer/build/histogram_recording.bin`. There is no `.gitignore` yet, so build folders and recordings get staged by `git add -A`.
+
+Both build with C++17 and `-Wall -Wextra -Wpedantic`. Running either test needs the GenX320 V4L2 driver on the Jetson.
 
 Modules include `types.h` / `config.h` by bare name, so compiling them needs `-Iinclude -Iconfig`. To check a single file builds:
 
@@ -56,9 +58,11 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
 - **Shared streamer interface:** `Evt21Streamer` and `Evt21StreamerFromFile` must keep **identical interfaces** so either can feed the pipeline. The interface is `initialize(source, sensor_device)`, `start()`, `stop()`, `getBuffer()` → `evt21_buffer` (`uint64_t*`), `wordCount()`, `releaseBuffer()`. Only one buffer may be held at a time; it must be released before the next `getBuffer()`. A camera buffer is zero-copy mapped memory and is requeued on release. The file streamer returns `nullptr` at EOF.
 - **`addressEventCamera`** (`src/modules/addressEventCamera/`):
   - `evt21Decoder` holds every EVT2.1 bit layout constant. Keep new field extraction there rather than in the modules that use it. It provides `get_evt21_word_type`, `get_time_stamp`, `get_time_high` / `get_time_high_duration` (wrap-safe, 28-bit), `get_x` / `get_y` (`size_t`, for indexing), `get_valid_mask` and `is_valid_event`.
-  - `histogram_buffer` / `histograms` are implemented: a ring of 5 per-pixel signed event histograms that hands out time-adjacent pairs for optic flow. Time surfaces don't exist yet. None of these files are in a CMake target yet.
+  - `histogram_buffer` / `histograms` are implemented: a ring of 5 per-pixel signed event histograms that hands out time-adjacent pairs for optic flow. Their tunables, `HISTOGRAM_BUFFER_COUNT` (5) and `HISTOGRAM_TIME_HIGH_WIDTH` (40), are `static constexpr` members in `histograms.h`, not in `config.h`. Time surfaces aren't built yet: only the `time_surface` type exists in `types.h`, as a raw `timestamp_us[PIXEL_NUM]` C array; make it a `std::array` like `histogram_array` before using it. The histogram files are built only by the `histogram_buffer_writer` test. `histogram_buffer` exposes `getTimeHighStart()` (decoded TIME_HIGH the window began at) for logging.
 
-- **`fileWriter`** (`src/modules/fileWriter/`): `writeHistograms` logs histograms (`uint64_t` TIME_HIGH start + raw 320×320 `int16_t`, fixed-size records, no file header) from a background thread. `tryWrite()` copies into a preallocated 32-slot ring and returns `false` (counting a drop) when full, never blocking the pipeline. Only the ring is shared between threads, so the pipeline stays single-threaded. Linking it needs `-pthread`.
+- **`fileWriter`** (`src/modules/fileWriter/`): `writeHistograms` logs histograms (`uint64_t` TIME_HIGH start + raw 320×320 `int16_t`, fixed-size records, no file header) from a background thread. `tryWrite()` copies into a preallocated 32-slot ring and returns `false` (counting a drop) when full, never blocking the pipeline. Only the ring is shared between threads, so the pipeline stays single-threaded. Linking it needs `-pthread` (`Threads::Threads` in CMake). `tryWrite()` throws `std::logic_error` if the buffer isn't READY/HELD or the writer isn't started, and rethrows a disk error from the writer thread. `stop()` drains the ring, joins, `fdatasync`s and closes. The ring (32 × 204,808 B ≈ 6.5 MB) is allocated once and kept across `stop()`/`initialize()`. The file-only `fail()`/`writeAll()` helpers live in its anonymous namespace, not `v4l2Util.h`, because that header pulls in `<linux/videodev2.h>`.
+  - Log every window once: consecutive pairs overlap, so write only `newer` of each pair (plus `older` of the first). Read a recording with `np.fromfile(path, dtype=[('t','<u8'),('hist','<i2',(320,320))])`; consecutive `t` should differ by exactly 40.
+  - Full logging is about 80 MB/s (≈390 windows/s × 204,808 B), so record to NVMe, never tmpfs.
 
 ### Histogram memory design
 
@@ -83,6 +87,22 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
 - **Bad words:** POS/NEG words failing `is_valid_event` (misaligned x, or off the sensor) are skipped and counted in `getBadWordCount()` rather than stopping the stream. `histogram_buffer::updateHistogram` still throws on them as a safety net, so the check currently runs twice per word.
 - **Still open:** it isn't thread-safe. `updateHistograms` and dequeue/queue must run on the same thread until the state becomes atomic. Making `dequeueHistogramPair()` lock-free also needs a back-out if the older buffer is reused between taking the newer and the older one.
 
+### Hardware findings (GenX320 on the Jetson, Oct 2026)
+
+- **Startup blackout:** about 200–220 ms of TIME_HIGH goes missing a few windows (≈30 ms) after STREAMON. It is a camera kernel driver quirk at startup, not a pipeline bug, and appeared in both recordings.
+- **Startup burst:** the first window after STREAMON had ~55,900 active pixels (over half the sensor) versus a median of ~790 for the rest of a quiet scene. Discard every window up to the end of the blackout (≈250 ms after STREAMON) before optic flow or analysis.
+- **Windows per camera buffer:** in a low-event-rate scene each V4L2 buffer held 5–8 ms of events, i.e. 2–3 windows. Quiet scenes make buffers span more time, which is what makes newest-only `dequeueHistogramPair()` skip windows. With in-order `dequeueNextHistogramPair()` a 100-buffer recording (≈850 ms) gave 255 records with every gap exactly 40 ticks apart except the startup blackout. 3 windows per buffer is the limit at `HISTOGRAM_BUFFER_COUNT = 5`; it needs to be at least windows per buffer + 2, so raise it (e.g. to 8, +600 KB) if quieter scenes exceed that.
+- Per-pixel window values seen so far range from −4 to +8.
+
+### Open items
+
+- Discard the startup burst/blackout windows in the pipeline.
+- Possibly raise `HISTOGRAM_BUFFER_COUNT` (see above).
+- Time surfaces, optic flow, IMU fusion and the PX4 link.
+- Move the capture test onto `Evt21Streamer`; it also doesn't check `V4L2_BUF_FLAG_ERROR`.
+- Nits: `Evt21StreamerFromFile::start()` reports "initialize the file before starting it" when it is already started; `evt21Streamer/README.md` misspells `genx320Drvier`.
+- Add a `.gitignore` for build folders and `.bin`/`.raw` recordings.
+
 Each module directory has a README stating its intended contract. Read it before changing a module.
 
 ## EVT2.1 format
@@ -100,4 +120,6 @@ Error handling uses exceptions. Syscall failures throw `std::system_error` with 
 
 ## Workflow
 
-Roshan Patel is currently the only contributor. "Push this" means stage everything, untracked files included (`git add -A`), commit, and push straight to main with `git push origin main`.
+Roshan Patel is currently the only contributor. "Push this" means stage everything, untracked files included (`git add -A`), commit, and push the current branch with `git push origin HEAD`. Commit straight to whatever branch is checked out (currently `streamline-driver-streamer`).
+
+Code reaches the Jetson only through git: commit and push here, then `git pull` on the Jetson (repo at `~/Jetson-Event-VIO`, reachable over SSH as `jetson@jetson.local`). Recordings come back the other way with `scp`. Over Wi-Fi a 50 MB recording takes more than a minute, so use a long timeout. Always check `git status` before saying something is or isn't committed.
