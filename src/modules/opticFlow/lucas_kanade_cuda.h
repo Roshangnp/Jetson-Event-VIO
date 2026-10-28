@@ -7,7 +7,8 @@
 //
 // Runs in passes like the CPU path, so each pixel's derivatives are computed once:
 //   getHxy_array + getHt_array (one thread per pixel) -> getLKMatrix_arrays -> LK_method (one thread per
-//   grid point). The derivative passes cover every pixel regardless of the mask.
+//   grid point). The derivative passes cover every pixel regardless of the mask. The derivatives take the
+//   raw histograms, or Gaussian-smoothed ones (histogram_filters_cuda::applyGuassianSmoothing).
 
 #include <cstdint>
 #include <cuda_runtime_api.h>
@@ -19,15 +20,20 @@ namespace lucas_kanade_cuda
     // spatial derivatives (dH/dx, dH/dy) of d_hist (the newer histogram) at every pixel. GAUSSIAN isn't
     // implemented yet (throws std::logic_error).
     void getHxy_array(const histogram_array* d_hist, Hxy_array* d_hxy_array, spatial_derivative method, cudaStream_t stream);
+    void getHxy_array(const smoothed_histogram_array* d_hist, Hxy_array* d_hxy_array, spatial_derivative method,
+                      cudaStream_t stream);
 
     // second-order temporal derivative at every pixel: (SGF_HT * newer - SGF_HT * older) / window length
     // (Rueckauer & Delbruck 2016, eq. 5)
     void getHt_array(const histogram_array* d_hist_newer, const histogram_array* d_hist_older, Ht_array* d_ht_array,
                      cudaStream_t stream);
+    void getHt_array(const smoothed_histogram_array* d_hist_newer, const smoothed_histogram_array* d_hist_older,
+                     Ht_array* d_ht_array, cudaStream_t stream);
 
-    // sums the structure matrix (A'A) and A'b over each valid grid point's PATCH_WIDTH x PATCH_WIDTH patch.
-    // Masked grid points are zeroed.
-    void getLKMatrix_arrays(const Hxy_array* d_hxy_array, const Ht_array* d_ht_array,
+    // sums the structure matrix (A'A) and A'b over each valid grid point's PATCH_WIDTH x PATCH_WIDTH patch,
+    // separably: a row pass into d_row_sums (scratch), then a column pass per grid point, so 2 * PATCH_WIDTH
+    // terms per grid point instead of PATCH_WIDTH^2. Masked grid points are zeroed.
+    void getLKMatrix_arrays(const Hxy_array* d_hxy_array, const Ht_array* d_ht_array, LK_row_sums_array* d_row_sums,
                             Structure_Matrix_array* d_structure_matrix_array,
                             Time_Grad_Matrix_array* d_time_grad_matrix_array, const uint8_t* d_mask, cudaStream_t stream);
 

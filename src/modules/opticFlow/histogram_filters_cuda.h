@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cuda_runtime_api.h>
 #include "types.h"
+#include "flow_types.h"
 
 namespace histogram_filters_cuda
 {
@@ -20,4 +21,9 @@ namespace histogram_filters_cuda
     // method 2: Hessian ridge condition. Not implemented yet (the Gaussian kernels and the ridge
     // criterion aren't defined); throws std::logic_error.
     void getValidHistMask_method2(const histogram_array* d_hist, uint8_t* d_mask, cudaStream_t stream);
+
+    // smooths d_hist with a normalised (2 * GUASSIAN_SMOOTHING_RADIUS + 1)^2 Gaussian of sigma
+    // GUASSIAN_SMOOTHING_SIGMA (filters, config.h) into d_smoothed, at every pixel. Reads past the sensor
+    // edge are clamped (border pixels repeated), like the derivative kernels. No CPU version yet.
+    void applyGuassianSmoothing(const histogram_array* d_hist, smoothed_histogram_array* d_smoothed, cudaStream_t stream);
 }

@@ -19,8 +19,10 @@ namespace
 // Device copies of the pipeline arrays. Allocated once and kept until stop(), so a run never allocates.
 struct optic_flow::gpu_buffers {
     histogram_array* pair = nullptr;   // [0] newer, [1] older
+    smoothed_histogram_array* smoothed_pair = nullptr;   // [0] newer, [1] older, when gaussian_smoothing
     Hxy_array* hxy_array = nullptr;
     Ht_array* ht_array = nullptr;
+    LK_row_sums_array* row_sums = nullptr;
     Structure_Matrix_array* structure_matrix_array = nullptr;
     Time_Grad_Matrix_array* time_grad_matrix_array = nullptr;
     uint8_t* mask = nullptr;           // one byte per grid point, 1 = valid
@@ -44,8 +46,10 @@ struct optic_flow::gpu_buffers {
 
             cuda_util::check(cudaStreamCreate(&stream), "optic_flow: cudaStreamCreate");
             deviceAlloc(pair, 2 * sizeof(histogram_array), "optic_flow: cudaMalloc histogram pair");
+            deviceAlloc(smoothed_pair, 2 * sizeof(smoothed_histogram_array), "optic_flow: cudaMalloc smoothed pair");
             deviceAlloc(hxy_array, sizeof(Hxy_array), "optic_flow: cudaMalloc spatial derivatives");
             deviceAlloc(ht_array, sizeof(Ht_array), "optic_flow: cudaMalloc temporal derivatives");
+            deviceAlloc(row_sums, sizeof(LK_row_sums_array), "optic_flow: cudaMalloc patch row sums");
             deviceAlloc(structure_matrix_array, sizeof(Structure_Matrix_array), "optic_flow: cudaMalloc structure matrices");
             deviceAlloc(time_grad_matrix_array, sizeof(Time_Grad_Matrix_array), "optic_flow: cudaMalloc time gradients");
             deviceAlloc(mask, flowConfig::GRID_POINT_NUM, "optic_flow: cudaMalloc mask");
@@ -78,8 +82,10 @@ struct optic_flow::gpu_buffers {
             (void)cudaStreamSynchronize(stream);
         }
         (void)cudaFree(pair);
+        (void)cudaFree(smoothed_pair);
         (void)cudaFree(hxy_array);
         (void)cudaFree(ht_array);
+        (void)cudaFree(row_sums);
         (void)cudaFree(structure_matrix_array);
         (void)cudaFree(time_grad_matrix_array);
         (void)cudaFree(mask);
@@ -92,8 +98,10 @@ struct optic_flow::gpu_buffers {
             (void)cudaStreamDestroy(stream);
         }
         pair = nullptr;
+        smoothed_pair = nullptr;
         hxy_array = nullptr;
         ht_array = nullptr;
+        row_sums = nullptr;
         structure_matrix_array = nullptr;
         time_grad_matrix_array = nullptr;
         mask = nullptr;
@@ -128,6 +136,9 @@ void optic_flow::beginRun(const histograms::histogram_buffer_pair& hist_pair)
 
 const flow_field& optic_flow::run_LK_method_CPU(histograms::histogram_buffer_pair& hist_pair)
 {
+    if (gaussian_smoothing) {
+        throw std::logic_error("optic_flow: Gaussian smoothing has no CPU version yet; set gaussian_smoothing = false");
+    }
     beginRun(hist_pair);
     const histogram_array& newer = *hist_pair[0]->getHistogram();
     const histogram_array& older = *hist_pair[1]->getHistogram();
@@ -146,7 +157,7 @@ const flow_field& optic_flow::run_LK_method_CPU(histograms::histogram_buffer_pai
 
     lucas_kanade::getHxy_array(newer, hxy_array_, spacial_derivitive_type);
     lucas_kanade::getHt_array(newer, older, ht_array_);
-    lucas_kanade::getLKMatrix_arrays(hxy_array_, ht_array_, structure_matrix_array_, time_grad_matrix_array_, mask_);
+    lucas_kanade::getLKMatrix_arrays(hxy_array_, ht_array_, row_sums_, structure_matrix_array_, time_grad_matrix_array_, mask_);
     lucas_kanade::LK_method(structure_matrix_array_, time_grad_matrix_array_, flow_, mask_);
     return flow_;
 }
@@ -178,9 +189,17 @@ const flow_field& optic_flow::run_LK_method_GPU(histograms::histogram_buffer_pai
                 break;
         }
 
-        lucas_kanade_cuda::getHxy_array(&gpu.pair[0], gpu.hxy_array, spacial_derivitive_type, gpu.stream);
-        lucas_kanade_cuda::getHt_array(&gpu.pair[0], &gpu.pair[1], gpu.ht_array, gpu.stream);
-        lucas_kanade_cuda::getLKMatrix_arrays(gpu.hxy_array, gpu.ht_array, gpu.structure_matrix_array,
+        // the filters above look at the raw newer histogram; the derivatives use the smoothed pair if enabled
+        if (gaussian_smoothing) {
+            histogram_filters_cuda::applyGuassianSmoothing(&gpu.pair[0], &gpu.smoothed_pair[0], gpu.stream);
+            histogram_filters_cuda::applyGuassianSmoothing(&gpu.pair[1], &gpu.smoothed_pair[1], gpu.stream);
+            lucas_kanade_cuda::getHxy_array(&gpu.smoothed_pair[0], gpu.hxy_array, spacial_derivitive_type, gpu.stream);
+            lucas_kanade_cuda::getHt_array(&gpu.smoothed_pair[0], &gpu.smoothed_pair[1], gpu.ht_array, gpu.stream);
+        } else {
+            lucas_kanade_cuda::getHxy_array(&gpu.pair[0], gpu.hxy_array, spacial_derivitive_type, gpu.stream);
+            lucas_kanade_cuda::getHt_array(&gpu.pair[0], &gpu.pair[1], gpu.ht_array, gpu.stream);
+        }
+        lucas_kanade_cuda::getLKMatrix_arrays(gpu.hxy_array, gpu.ht_array, gpu.row_sums, gpu.structure_matrix_array,
                                               gpu.time_grad_matrix_array, gpu.mask, gpu.stream);
         lucas_kanade_cuda::LK_method(gpu.structure_matrix_array, gpu.time_grad_matrix_array, gpu.flow, gpu.mask, gpu.stream);
 

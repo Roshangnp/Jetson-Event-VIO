@@ -23,8 +23,8 @@
 // static_asserts below and the fileWriter README).
 class writeFlows{
     public:
-    // A flow_field is ~1.2 MB at a dense 3x3 grid (6x a histogram record), so the ring is
-    // smaller than writeHistograms' 32: 8 slots is ~9.7 MB.
+    // A flow_field is ~1.15 MB at a dense 11x11 grid (~6x a histogram record), so the ring is
+    // smaller than writeHistograms' 32: 8 slots is ~9.2 MB.
     static constexpr size_t SLOT_COUNT = 8;
 
     // One record on disk and one slot in the ring.
@@ -37,7 +37,7 @@ class writeFlows{
     writeFlows() = default;
     ~writeFlows();
 
-    // non-copyable, owns a file, a thread and ~9.7 MB of slots
+    // non-copyable, owns a file, a thread and ~9.2 MB of slots
     writeFlows(const writeFlows&) = delete;
     writeFlows& operator=(const writeFlows&) = delete;
 

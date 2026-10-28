@@ -18,9 +18,11 @@ namespace lucas_kanade
     // (Rueckauer & Delbruck 2016, eq. 5)
     void getHt_array(const histogram_array& hist_newer, const histogram_array& hist_older, Ht_array& ht_array);
 
-    // sums the structure matrix (A'A) and A'b over each valid grid point's PATCH_WIDTH x PATCH_WIDTH patch.
-    // Masked grid points are zeroed.
-    void getLKMatrix_arrays(const Hxy_array& hxy_array, const Ht_array& ht_array, Structure_Matrix_array& structure_matrix_array,
+    // sums the structure matrix (A'A) and A'b over each valid grid point's PATCH_WIDTH x PATCH_WIDTH patch,
+    // separably: a row pass into row_sums (scratch), then a column pass per grid point, so 2 * PATCH_WIDTH
+    // terms per grid point instead of PATCH_WIDTH^2. Masked grid points are zeroed.
+    void getLKMatrix_arrays(const Hxy_array& hxy_array, const Ht_array& ht_array, LK_row_sums_array& row_sums,
+                            Structure_Matrix_array& structure_matrix_array,
                             Time_Grad_Matrix_array& time_grad_matrix_array, const grid_mask& mask);
 
     // Using the Structure_Matrix_array and the Time_Grad_Matrix_array computes flow feild while accounting for the valid mask created by the filters further refined the mask with the shi tompsi helper function

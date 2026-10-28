@@ -14,9 +14,9 @@ Consecutive pairs from dequeueHistogramPair() overlap, so write only the newer h
 
 writeFlows:
 
-Identical to writeHistograms, but logs optic flow: tryWrite(flow, time_high) copies a flow_field and optic_flow::getTimeHigh() into a free slot. The ring has 8 slots (about 9.7 MB), not 32, because one flow_field is about 1.2 MB at a dense 3x3 grid. Logging every window would be about 470 MB/s (390 windows/s x 1.2 MB), so log only some windows.
+Identical to writeHistograms, but logs optic flow: tryWrite(flow, time_high) copies a flow_field and optic_flow::getTimeHigh() into a free slot. The ring has 8 slots (about 9.2 MB), not 32, because one flow_field is about 1.15 MB at a dense 11x11 grid. Logging every window would be about 450 MB/s (390 windows/s x 1.15 MB), so log only some windows.
 
-File layout: no file header, back to back flow_records in native byte order, written straight from memory, so the compiler's padding is included (static_asserts in writeFlows.h fail the build if the layout changes). One record (1,213,512 bytes at a dense 3x3 grid):
+File layout: no file header, back to back flow_records in native byte order, written straight from memory, so the compiler's padding is included (static_asserts in writeFlows.h fail the build if the layout changes). One record (24 + GRID_HEIGHT x GRID_WIDTH x 12 bytes: 1,153,224 at a dense 11x11 grid):
 
     offset  0  uint64  time_high        optic_flow::getTimeHigh() (newer window start + 40)
     offset  8  uint64  time_high_start  flow_field: older window start
@@ -26,7 +26,7 @@ File layout: no file header, back to back flow_records in native byte order, wri
                8  bool      valid
                9  3 bytes padding
 
-In Python (G = 318 for PATCH_WIDTH 3, GRID_STRIDE 1; grid point (gy, gx) is centred on pixel
+In Python (G = GRID_WIDTH = GRID_HEIGHT: 310 for PATCH_WIDTH 11, 318 for 3, at GRID_STRIDE 1; grid point (gy, gx) is centred on pixel
 (gy + PATCH_RADIUS, gx + PATCH_RADIUS) at stride 1):
 
     patch = np.dtype({'names': ['flow', 'valid'], 'formats': [('<f4', 2), '?'],

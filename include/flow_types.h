@@ -37,7 +37,7 @@ struct flow_patch {
     bool valid;
 };
 
-// One flow estimate per grid point, row-major. 12 B per grid point, so ~1.2 MB at a dense 3x3 grid; like
+// One flow estimate per grid point, row-major. 12 B per grid point, so ~1.15 MB at a dense 11x11 grid; like
 // histograms it must live in static storage or a single std::make_unique, never on the stack.
 struct flow_field {
     // TIME_HIGH span the flow was measured over (older window start -> newer window end)
@@ -54,6 +54,15 @@ using Time_Grad_Matrix_array = std::array<Time_Grad_Matrix, flowConfig::GRID_POI
 // second-order temporal derivative (~400 KB). Same storage rule as flow_field: static or one make_unique.
 using Hxy_array = std::array<vector2d, cameraConfig::PIXEL_NUM>;
 using Ht_array = std::array<float, cameraConfig::PIXEL_NUM>;
+
+// a Gaussian-smoothed histogram, row-major over the sensor (~400 KB)
+using smoothed_histogram_array = std::array<float, cameraConfig::PIXEL_NUM>;
+
+// Scratch for the separable LK patch sums: for every sensor row y and grid column gx, the 5 products
+// (Hx^2, HxHy, Hy^2, Hx Htt, Hy Htt) summed across the patch width. Index (k * HEIGHT + y) * GRID_WIDTH + gx,
+// k = product. ~2 MB at a dense 11x11 grid.
+inline constexpr size_t LK_PRODUCT_NUM = 5;
+using LK_row_sums_array = std::array<float, LK_PRODUCT_NUM * cameraConfig::HEIGHT * flowConfig::GRID_WIDTH>;
 
 // pixel coordinate of a grid point's patch centre
 inline constexpr size_t grid_to_pixel(size_t grid_index)

@@ -14,12 +14,12 @@
 #include "writeFlows.h"
 #include "writeHistograms.h"
 
-// ~2.4 MB and ~4.9 MB, too big for the stack
+// ~2.4 MB and ~6.7 MB, too big for the stack
 static histograms hist;
 static optic_flow flow;
 
-// log every Nth flow_field and the histogram pair it came from: one flow_field is ~1.2 MB, so
-// logging every window (~390/s) would be ~470 MB/s
+// log every Nth flow_field and the histogram pair it came from: one flow_field is ~1.15 MB, so
+// logging every window (~390/s) would be ~450 MB/s
 constexpr size_t LOG_EVERY_N = 20;
 
 // the pipeline runs this long without logging before recording starts, so the startup burst and

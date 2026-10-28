@@ -54,14 +54,6 @@ namespace
     // one TIME_HIGH tick is 64 us, so a histogram window lasts this many seconds
     constexpr float WINDOW_SECONDS = histograms::HISTOGRAM_TIME_HIGH_WIDTH * 64e-6f;
 
-    // pixel index of the centre of a grid point's patch
-    size_t gridToCentrePixelIndex(size_t grid_index)
-    {
-        const size_t x = grid_to_pixel(grid_index % flowConfig::GRID_WIDTH);
-        const size_t y = grid_to_pixel(grid_index / flowConfig::GRID_WIDTH);
-        return y * W + x;
-    }
-
     // the Shi-Tomasi test on a structure matrix's smaller eigenvalue
     bool passesShiTomasi(float min_eigenvalue)
     {
@@ -118,21 +110,21 @@ namespace lucas_kanade
         }
     }
 
-    void getLKMatrix_arrays(const Hxy_array& hxy_array, const Ht_array& ht_array, Structure_Matrix_array& structure_matrix_array,
+    void getLKMatrix_arrays(const Hxy_array& hxy_array, const Ht_array& ht_array, LK_row_sums_array& row_sums,
+                            Structure_Matrix_array& structure_matrix_array,
                             Time_Grad_Matrix_array& time_grad_matrix_array, const grid_mask& mask)
     {
-        for (size_t grid_index = 0; grid_index < flowConfig::GRID_POINT_NUM; ++grid_index) {
-            if (!mask[grid_index]) {
-                structure_matrix_array[grid_index].setZero();
-                time_grad_matrix_array[grid_index].setZero();
-                continue;
-            }
-            // the grid keeps centres PATCH_RADIUS from the edge, so every patch pixel is on the sensor
-            const int centre = static_cast<int>(gridToCentrePixelIndex(grid_index));
-            float sxx = 0.f, sxy = 0.f, syy = 0.f, sxt = 0.f, syt = 0.f;
-            for (int dy = -R; dy <= R; ++dy) {
+        constexpr size_t GW = flowConfig::GRID_WIDTH;
+        constexpr size_t PLANE = static_cast<size_t>(H) * GW;   // one plane per product, as on the GPU
+
+        // row pass: every sensor row, every grid column, whatever the mask
+        for (int y = 0; y < H; ++y) {
+            for (size_t gx = 0; gx < GW; ++gx) {
+                // the grid keeps centres PATCH_RADIUS from the edge, so every patch pixel is on the sensor
+                const int cx = static_cast<int>(grid_to_pixel(gx));
+                float sxx = 0.f, sxy = 0.f, syy = 0.f, sxt = 0.f, syt = 0.f;
                 for (int dx = -R; dx <= R; ++dx) {
-                    const size_t pixel_index = static_cast<size_t>(centre + dy * W + dx);
+                    const size_t pixel_index = static_cast<size_t>(y * W + cx + dx);
                     const vector2d& g = hxy_array[pixel_index];
                     const float htt = ht_array[pixel_index];
                     sxx += g.x() * g.x();
@@ -141,10 +133,34 @@ namespace lucas_kanade
                     sxt += g.x() * htt;
                     syt += g.y() * htt;
                 }
+                const size_t index = static_cast<size_t>(y) * GW + gx;
+                row_sums[0 * PLANE + index] = sxx;
+                row_sums[1 * PLANE + index] = sxy;
+                row_sums[2 * PLANE + index] = syy;
+                row_sums[3 * PLANE + index] = sxt;
+                row_sums[4 * PLANE + index] = syt;
             }
-            structure_matrix_array[grid_index] << sxx, sxy,
-                                                  sxy, syy;
-            time_grad_matrix_array[grid_index] = Time_Grad_Matrix(sxt, syt);
+        }
+
+        // column pass: the row sums of each valid grid point's patch rows
+        for (size_t grid_index = 0; grid_index < flowConfig::GRID_POINT_NUM; ++grid_index) {
+            if (!mask[grid_index]) {
+                structure_matrix_array[grid_index].setZero();
+                time_grad_matrix_array[grid_index].setZero();
+                continue;
+            }
+            const size_t gx = grid_index % GW;
+            const int cy = static_cast<int>(grid_to_pixel(grid_index / GW));
+            float sum[LK_PRODUCT_NUM] = {0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int dy = -R; dy <= R; ++dy) {
+                const size_t index = static_cast<size_t>(cy + dy) * GW + gx;
+                for (size_t k = 0; k < LK_PRODUCT_NUM; ++k) {
+                    sum[k] += row_sums[k * PLANE + index];
+                }
+            }
+            structure_matrix_array[grid_index] << sum[0], sum[1],
+                                                  sum[1], sum[2];
+            time_grad_matrix_array[grid_index] = Time_Grad_Matrix(sum[3], sum[4]);
         }
     }
 
