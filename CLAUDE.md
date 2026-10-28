@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Visual-inertial odometry for a Jetson Orin NX using a Prophesee GenX320 event camera (320×320). The goal is to estimate velocity from ego-motion in the event stream and send it to a PX4 flight controller. The camera input path, the EVT2.1 decoder, the event histograms and a threaded histogram file logger exist so far, and the camera → histograms path has been validated on hardware (see Hardware findings). Time surfaces, optic flow, IMU fusion and the PX4 link are unimplemented.
+Visual-inertial odometry for a Jetson Orin NX using a Prophesee GenX320 event camera (320×320). The goal is to estimate velocity from ego-motion in the event stream and send it to a PX4 flight controller. The camera input path, the EVT2.1 decoder, the event histograms and a threaded histogram file logger exist so far, and the camera → histograms path has been validated on hardware (see Hardware findings). Optic flow has started: its types (`include/flow_types.h`) and the histogram filter interface (`src/modules/opticFlow/histogram_filters.h`) are declared but not implemented. Time surfaces, the Lucas-Kanade solve, IMU fusion and the PX4 link are unimplemented.
 
 ## Build
 
@@ -31,6 +31,8 @@ Modules include `types.h` / `config.h` by bare name, so compiling them needs `-I
 ```
 g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude -Iconfig -c src/modules/addressEventCamera/evt21Decoder.cpp
 ```
+
+Anything including `flow_types.h` or the opticFlow headers also needs Eigen: `-isystem external/eigen -DEIGEN_MPL2_ONLY`, or in CMake `target_include_directories(<target> SYSTEM PRIVATE ../../external/eigen)` plus `target_compile_definitions(<target> PRIVATE EIGEN_MPL2_ONLY)`. `SYSTEM`/`-isystem` keeps `-Wall -Wextra -Wpedantic` quiet about Eigen's own headers. No CMake target uses Eigen yet.
 
 There is no test framework or linter.
 
@@ -63,6 +65,21 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
 - **`fileWriter`** (`src/modules/fileWriter/`): `writeHistograms` logs histograms (`uint64_t` TIME_HIGH start + raw 320×320 `int16_t`, fixed-size records, no file header) from a background thread. `tryWrite()` copies into a preallocated 32-slot ring and returns `false` (counting a drop) when full, never blocking the pipeline. Only the ring is shared between threads, so the pipeline stays single-threaded. Linking it needs `-pthread` (`Threads::Threads` in CMake). `tryWrite()` throws `std::logic_error` if the buffer isn't READY/HELD or the writer isn't started, and rethrows a disk error from the writer thread. `stop()` drains the ring, joins, `fdatasync`s and closes. The ring (32 × 204,808 B ≈ 6.5 MB) is allocated once and kept across `stop()`/`initialize()`. The file-only `fail()`/`writeAll()` helpers live in its anonymous namespace, not `v4l2Util.h`, because that header pulls in `<linux/videodev2.h>`.
   - Log every window once: consecutive pairs overlap, so write only `newer` of each pair (plus `older` of the first). Read a recording with `np.fromfile(path, dtype=[('t','<u8'),('hist','<i2',(320,320))])`; consecutive `t` should differ by exactly 40.
   - Full logging is about 80 MB/s (≈390 windows/s × 204,808 B), so record to NVMe, never tmpfs.
+
+- **Eigen** (`external/eigen`) is Eigen 3.4.0, headers only, vendored so neither machine needs a system install; `external/eigen/VERSION` records the source URL and sha256. Use only fixed-size Eigen types (`Vector2f`, `Matrix2f`, …), never `MatrixXf`/`VectorXf`, and `float` rather than `double` (NEON fp32). Keep Eigen out of `types.h` and `config.h` so modules that don't use flow don't depend on it. Eigen types aren't `constexpr`, so compile-time constants such as kernels are `std::array`.
+- **Flow types** (`include/flow_types.h`):
+  - `vector2d` (`Eigen::Vector2f`) is flow in pixels per second, image frame (x right, y down). `eigenValues2d` / `eigenVectors2d` hold the structure tensor's eigen decomposition.
+  - `flow_patch` is one grid point's result (flow, eigenvalues, eigenvectors, `valid`). It is 48 B and 16-byte aligned because of the `Matrix2f`.
+  - `flow_field` is the TIME_HIGH start/end plus one `flow_patch` per grid point, row-major. Dense with 3×3 patches it's ≈4.85 MB, so the `histograms` storage rule applies: static storage or a single `make_unique`, never the stack.
+  - `grid_mask` is `std::bitset<GRID_POINT_NUM>`, one bit per grid point (≈12.6 KB dense), always passed by reference.
+  - `grid_to_pixel(grid_index)` gives a patch centre's pixel coordinate along one axis.
+- **Flow grid** (`flowConfig` in `config.h`): `PATCH_WIDTH` (odd, currently 3) and `GRID_STRIDE` (pixel distance between patch centres; 1 = dense) define the grid, and patches overlap when the stride is below the width. `GRID_WIDTH` / `GRID_HEIGHT` / `GRID_POINT_NUM` are derived and keep only centres whose whole patch fits on the sensor, so there is no edge padding (dense 3×3 → 318×318, dense 5×5 → 316×316). 5×5 over a ~2.5 ms window is verified in event-dense scenes. Functions index by `grid_index`, not pixel index; the two only coincide at stride 1. `HISTOGRAM_MIN_THRESH` (2) is method 1's cutoff.
+- **Filter constants** (`filters` in `config.h`): Gaussian sigma (placeholder value) and width, Savitzky-Golay (SGF) width, and the 3×3 SGF kernels as `filters::kernel3x3` (`std::array<float, 9>`, row-major, index = row·3 + col, row = y). Use float literals (`1.0f/6`); `1/6` is integer division and evaluates to 0.
+- **`opticFlow`** (`src/modules/opticFlow/`), namespace `histogram_filters` in `histogram_filters.h`. These are standalone functions taking `const histogram_array&`, kept separate from the Lucas-Kanade solve, which will get its own header:
+  - **Mask pipeline:** `getValidHistMask_method1` (threshold on histogram magnitude) and `getValidHistMask_method2` (Hessian ridge condition) take a `grid_mask&` and return `void`. Each only considers bits already set and clears the ones it rejects, so filters chain: `mask.set()`, then apply them in any order.
+  - **Derivatives at a `grid_index`:** `applySGF_XY` / `applySGF_T` (Savitzky-Golay), `applyGuassianConvolution_firstOrder` (alternative to `applySGF_XY`) and `applyGuassianConvolution_secondOrder` (for method 2's Hessian).
+  - **Naming vs. physics:** a histogram value is already the intensity change over the window, so `applySGF_T` needs only one histogram (it smooths the change), and the "spatial derivative of the histogram" is physically a mixed space-time derivative of intensity. The naming is known to be loose; leave it unless asked.
+  - Callers get the histogram as `*buffer->getHistogram()` after checking it's non-null.
 
 ### Histogram memory design
 
@@ -98,7 +115,9 @@ Data flows driver → streamer → addressEventCamera (decoder, histograms, time
 
 - Discard the startup burst/blackout windows in the pipeline.
 - Possibly raise `HISTOGRAM_BUFFER_COUNT` (see above).
-- Time surfaces, optic flow, IMU fusion and the PX4 link.
+- Implement `histogram_filters` and the Lucas-Kanade solve, and give the opticFlow module a CMake target with Eigen.
+- Spelling: `GUASSIAN` / `KERNAL` in `config.h` and `Guassian` in the `histogram_filters` function names.
+- Time surfaces, IMU fusion and the PX4 link.
 - Move the capture test onto `Evt21Streamer`; it also doesn't check `V4L2_BUF_FLAG_ERROR`.
 - Nits: `Evt21StreamerFromFile::start()` reports "initialize the file before starting it" when it is already started; `evt21Streamer/README.md` misspells `genx320Drvier`.
 - Add a `.gitignore` for build folders and `.bin`/`.raw` recordings.
