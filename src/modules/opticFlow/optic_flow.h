@@ -9,7 +9,7 @@
 #include "lucas_kanade.h"
 
 // Directs a histogram pair through the optic flow pipeline (filter -> derivatives -> LK) on the CPU or
-// the GPU, and owns every intermediate array. One object is ~8.5 MB (flow_field alone is ~4.85 MB at a
+// the GPU, and owns every intermediate array. One object is ~4.9 MB (flow_field alone is ~1.2 MB at a
 // dense 3x3 grid), so like histograms it must live in static storage or a single std::make_unique,
 // never on the stack. Non-copyable.
 //
@@ -31,8 +31,10 @@ class optic_flow{
     const flow_field& run_LK_method_CPU(histograms::histogram_buffer_pair& hist_pair);
 
     // runs the LK optical flow pipeline on the GPU, updates time_high with the latest timeHigh from hist pair
-    // (time_high_start of newest histogram + time_high_width). The GPU buffers (~8 MB) are allocated on
-    // the first call, which throws std::runtime_error if there is no usable CUDA device.
+    // (time_high_start of newest histogram + time_high_width). The GPU buffers (~4 MB, plus a 1.2 MB
+    // flow_field copy on a discrete GPU) are allocated on the first call, which throws std::runtime_error
+    // if there is no usable CUDA device. On an integrated GPU (Jetson) flow_ is pinned and the GPU writes
+    // it directly; on a discrete GPU it is copied back after the run.
     const flow_field& run_LK_method_GPU(histograms::histogram_buffer_pair& hist_pair);
 
     // releases the GPU buffers; the next run_LK_method_GPU allocates them again. Also called by the destructor.

@@ -19,21 +19,47 @@ namespace
 // Device copies of the pipeline arrays. Allocated once and kept until stop(), so a run never allocates.
 struct optic_flow::gpu_buffers {
     histogram_array* pair = nullptr;   // [0] newer, [1] older
+    Hxy_array* hxy_array = nullptr;
+    Ht_array* ht_array = nullptr;
     Structure_Matrix_array* structure_matrix_array = nullptr;
     Time_Grad_Matrix_array* time_grad_matrix_array = nullptr;
-    flow_field* flow = nullptr;
     uint8_t* mask = nullptr;           // one byte per grid point, 1 = valid
     cudaStream_t stream = nullptr;
 
-    gpu_buffers()
+    // Where LK writes the flow_field. On an integrated GPU (Jetson) the GPU shares the CPU's DRAM, so
+    // optic_flow's own flow_ is pinned and mapped and the GPU writes it in place: no 1.2 MB copy back.
+    // On a discrete GPU that would mean writing over PCIe, so it's a device copy copied back after the run.
+    flow_field* flow = nullptr;
+    // flow_ while it is registered (integrated GPU), else nullptr
+    flow_field* mapped_host_flow = nullptr;
+
+    explicit gpu_buffers(flow_field& host_flow)
     {
         try {
+            int device = 0;
+            int integrated = 0;
+            cuda_util::check(cudaGetDevice(&device), "optic_flow: cudaGetDevice");
+            cuda_util::check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device),
+                             "optic_flow: cudaDeviceGetAttribute(integrated)");
+
             cuda_util::check(cudaStreamCreate(&stream), "optic_flow: cudaStreamCreate");
             deviceAlloc(pair, 2 * sizeof(histogram_array), "optic_flow: cudaMalloc histogram pair");
+            deviceAlloc(hxy_array, sizeof(Hxy_array), "optic_flow: cudaMalloc spatial derivatives");
+            deviceAlloc(ht_array, sizeof(Ht_array), "optic_flow: cudaMalloc temporal derivatives");
             deviceAlloc(structure_matrix_array, sizeof(Structure_Matrix_array), "optic_flow: cudaMalloc structure matrices");
             deviceAlloc(time_grad_matrix_array, sizeof(Time_Grad_Matrix_array), "optic_flow: cudaMalloc time gradients");
-            deviceAlloc(flow, sizeof(flow_field), "optic_flow: cudaMalloc flow field");
             deviceAlloc(mask, flowConfig::GRID_POINT_NUM, "optic_flow: cudaMalloc mask");
+
+            if (integrated) {
+                cuda_util::check(cudaHostRegister(&host_flow, sizeof(flow_field), cudaHostRegisterMapped),
+                                 "optic_flow: cudaHostRegister flow field");
+                mapped_host_flow = &host_flow;
+                // the Orin reports canUseHostPointerForRegisteredMem = 0, so the kernel needs the device alias
+                cuda_util::check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&flow), &host_flow, 0),
+                                 "optic_flow: cudaHostGetDevicePointer flow field");
+            } else {
+                deviceAlloc(flow, sizeof(flow_field), "optic_flow: cudaMalloc flow field");
+            }
         } catch (...) {
             release();
             throw;
@@ -52,18 +78,27 @@ struct optic_flow::gpu_buffers {
             (void)cudaStreamSynchronize(stream);
         }
         (void)cudaFree(pair);
+        (void)cudaFree(hxy_array);
+        (void)cudaFree(ht_array);
         (void)cudaFree(structure_matrix_array);
         (void)cudaFree(time_grad_matrix_array);
-        (void)cudaFree(flow);
         (void)cudaFree(mask);
+        if (mapped_host_flow != nullptr) {
+            (void)cudaHostUnregister(mapped_host_flow);
+        } else {
+            (void)cudaFree(flow);
+        }
         if (stream != nullptr) {
             (void)cudaStreamDestroy(stream);
         }
         pair = nullptr;
+        hxy_array = nullptr;
+        ht_array = nullptr;
         structure_matrix_array = nullptr;
         time_grad_matrix_array = nullptr;
-        flow = nullptr;
         mask = nullptr;
+        flow = nullptr;
+        mapped_host_flow = nullptr;
         stream = nullptr;
     }
 };
@@ -120,7 +155,7 @@ const flow_field& optic_flow::run_LK_method_GPU(histograms::histogram_buffer_pai
 {
     beginRun(hist_pair);
     if (!gpu_) {
-        gpu_ = std::make_unique<gpu_buffers>();
+        gpu_ = std::make_unique<gpu_buffers>(flow_);
     }
     gpu_buffers& gpu = *gpu_;
 
@@ -143,20 +178,25 @@ const flow_field& optic_flow::run_LK_method_GPU(histograms::histogram_buffer_pai
                 break;
         }
 
-        lucas_kanade_cuda::getStructureMatrix_array(&gpu.pair[0], gpu.structure_matrix_array, gpu.mask,
-                                                    spacial_derivitive_type, gpu.stream);
-        lucas_kanade_cuda::getTimeGradMatrix_array(&gpu.pair[0], &gpu.pair[1], gpu.time_grad_matrix_array, gpu.mask,
-                                                   spacial_derivitive_type, gpu.stream);
+        lucas_kanade_cuda::getHxy_array(&gpu.pair[0], gpu.hxy_array, spacial_derivitive_type, gpu.stream);
+        lucas_kanade_cuda::getHt_array(&gpu.pair[0], &gpu.pair[1], gpu.ht_array, gpu.stream);
+        lucas_kanade_cuda::getLKMatrix_arrays(gpu.hxy_array, gpu.ht_array, gpu.structure_matrix_array,
+                                              gpu.time_grad_matrix_array, gpu.mask, gpu.stream);
         lucas_kanade_cuda::LK_method(gpu.structure_matrix_array, gpu.time_grad_matrix_array, gpu.flow, gpu.mask, gpu.stream);
 
-        // the kernels don't write the TIME_HIGH span, so keep the one beginRun set
-        const uint64_t time_high_start = flow_.time_high_start;
-        const uint64_t time_high_end = flow_.time_high_end;
-        cuda_util::check(cudaMemcpyAsync(&flow_, gpu.flow, sizeof(flow_field), cudaMemcpyDeviceToHost, gpu.stream),
-                         "optic_flow: copy flow field");
-        cuda_util::check(cudaStreamSynchronize(gpu.stream), "optic_flow: GPU pipeline");
-        flow_.time_high_start = time_high_start;
-        flow_.time_high_end = time_high_end;
+        if (gpu.mapped_host_flow != nullptr) {
+            // the GPU wrote flow_->patches in place; the TIME_HIGH span beginRun set is untouched
+            cuda_util::check(cudaStreamSynchronize(gpu.stream), "optic_flow: GPU pipeline");
+        } else {
+            // the kernels don't write the TIME_HIGH span, so keep the one beginRun set
+            const uint64_t time_high_start = flow_.time_high_start;
+            const uint64_t time_high_end = flow_.time_high_end;
+            cuda_util::check(cudaMemcpyAsync(&flow_, gpu.flow, sizeof(flow_field), cudaMemcpyDeviceToHost, gpu.stream),
+                             "optic_flow: copy flow field");
+            cuda_util::check(cudaStreamSynchronize(gpu.stream), "optic_flow: GPU pipeline");
+            flow_.time_high_start = time_high_start;
+            flow_.time_high_end = time_high_end;
+        }
     } catch (...) {
         // nothing may still be reading the pair or writing flow_ once this returns
         (void)cudaStreamSynchronize(gpu.stream);

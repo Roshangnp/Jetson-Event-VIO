@@ -23,8 +23,8 @@
 // static_asserts below and the fileWriter README).
 class writeFlows{
     public:
-    // A flow_field is ~4.85 MB at a dense 3x3 grid (24x a histogram record), so the ring is
-    // smaller than writeHistograms' 32: 8 slots is ~39 MB.
+    // A flow_field is ~1.2 MB at a dense 3x3 grid (6x a histogram record), so the ring is
+    // smaller than writeHistograms' 32: 8 slots is ~9.7 MB.
     static constexpr size_t SLOT_COUNT = 8;
 
     // One record on disk and one slot in the ring.
@@ -37,7 +37,7 @@ class writeFlows{
     writeFlows() = default;
     ~writeFlows();
 
-    // non-copyable, owns a file, a thread and ~39 MB of slots
+    // non-copyable, owns a file, a thread and ~9.7 MB of slots
     writeFlows(const writeFlows&) = delete;
     writeFlows& operator=(const writeFlows&) = delete;
 
@@ -99,7 +99,7 @@ class writeFlows{
 
 // The on-disk layout is the in-memory layout, so a change to these types changes the file
 // format. Update the fileWriter README's numpy dtype if any of these fail.
-static_assert(sizeof(flow_patch) == 48, "flow_patch layout changed: update the flow file format");
-static_assert(offsetof(writeFlows::flow_record, flow) == 16, "flow_record layout changed: update the flow file format");
-static_assert(sizeof(writeFlows::flow_record) == 16 + 16 + flowConfig::GRID_POINT_NUM * 48,
+static_assert(sizeof(flow_patch) == 12, "flow_patch layout changed: update the flow file format");
+static_assert(offsetof(writeFlows::flow_record, flow) == 8, "flow_record layout changed: update the flow file format");
+static_assert(sizeof(writeFlows::flow_record) == 8 + 16 + flowConfig::GRID_POINT_NUM * 12,
               "flow_record size changed: update the flow file format");

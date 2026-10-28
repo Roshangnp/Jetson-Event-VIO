@@ -33,14 +33,12 @@ using grid_mask = std::bitset<flowConfig::GRID_POINT_NUM>;
 
 struct flow_patch {
     vector2d flow;
-    eigenValues2d eigenValues;
-    eigenVectors2d eigenVectors;
     // false if the patch had too few events or only one edge direction (aperture problem)
     bool valid;
 };
 
-// One flow estimate per grid point, row-major. Dense 5x5 is ~1.6 MB, so like histograms it
-// must live in static storage or a single std::make_unique, never on the stack.
+// One flow estimate per grid point, row-major. 12 B per grid point, so ~1.2 MB at a dense 3x3 grid; like
+// histograms it must live in static storage or a single std::make_unique, never on the stack.
 struct flow_field {
     // TIME_HIGH span the flow was measured over (older window start -> newer window end)
     uint64_t time_high_start;

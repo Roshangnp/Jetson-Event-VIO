@@ -13,11 +13,11 @@
 #include "optic_flow.h"
 #include "writeFlows.h"
 
-// ~1 MB and ~8.5 MB, too big for the stack
+// ~2.4 MB and ~4.9 MB, too big for the stack
 static histograms hist;
 static optic_flow flow;
 
-// log every Nth flow_field: one is ~4.85 MB, so logging every window (~390/s) is far more than the disk sustains
+// log every Nth flow_field: one is ~1.2 MB, so logging every window (~390/s) would be ~470 MB/s
 constexpr size_t LOG_EVERY_N = 20;
 
 int main(int argc, char* argv[]){

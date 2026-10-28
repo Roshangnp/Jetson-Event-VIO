@@ -8,7 +8,10 @@
 
 class histograms{
     public:
-    static constexpr size_t HISTOGRAM_BUFFER_COUNT = 5;
+    // must be at least (windows per camera buffer) + 2 (1 FILLING, 1 HELD) for dequeueNextHistogramPair()
+    // to see every window. A quiet scene on the Jetson gave ~6.7 windows per buffer, so 12 leaves margin
+    // (~2.4 MB for the whole ring).
+    static constexpr size_t HISTOGRAM_BUFFER_COUNT = 12;
     static constexpr size_t HISTOGRAM_TIME_HIGH_WIDTH = 40;
     using histogram_buffer_array = std::array<histogram_buffer,HISTOGRAM_BUFFER_COUNT>;
     using histogram_buffer_pair = std::array<histogram_buffer*,2>;

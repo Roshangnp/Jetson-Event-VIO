@@ -68,24 +68,12 @@ namespace
         return min_eigenvalue >= flowConfig::SHI_TOMPSI_MIN_THRESH;
     }
 
-    // closed-form eigen decomposition of a symmetric 2x2 [[a, b], [b, c]]: eigenvalues largest first,
-    // eigenvectors as matching unit columns. Matches the CUDA version.
-    void eigenDecompose(const Structure_Matrix& m, eigenValues2d& values, eigenVectors2d& vectors)
+    // smaller eigenvalue of a symmetric 2x2 [[a, b], [b, c]], in closed form. Matches the CUDA version.
+    float minEigenvalue(const Structure_Matrix& m)
     {
         const float a = m(0, 0), b = m(0, 1), c = m(1, 1);
-        const float mean = 0.5f * (a + c), half_diff = 0.5f * (a - c);
-        const float root = std::sqrt(half_diff * half_diff + b * b);
-        const float l1 = mean + root;
-        values = eigenValues2d(l1, mean - root);
-
-        vector2d v1;
-        if (std::fabs(b) > 1e-12f) {
-            v1 = vector2d(l1 - c, b).normalized();
-        } else {
-            v1 = (a >= c) ? vector2d(1.f, 0.f) : vector2d(0.f, 1.f);
-        }
-        vectors.col(0) = v1;
-        vectors.col(1) = vector2d(-v1.y(), v1.x());
+        const float half_diff = 0.5f * (a - c);
+        return 0.5f * (a + c) - std::sqrt(half_diff * half_diff + b * b);
     }
 }
 
@@ -166,15 +154,12 @@ namespace lucas_kanade
             flow_patch& patch = flow.patches[grid_index];
             if (!mask[grid_index]) {
                 patch.flow.setZero();
-                patch.eigenValues.setZero();
-                patch.eigenVectors.setIdentity();
                 patch.valid = false;
                 continue;
             }
 
             const Structure_Matrix& m = structure_matrix_array[grid_index];
-            eigenDecompose(m, patch.eigenValues, patch.eigenVectors);
-            if (!passesShiTomasi(patch.eigenValues(1))) {
+            if (!passesShiTomasi(minEigenvalue(m))) {
                 mask.reset(grid_index);
                 patch.flow.setZero();
                 patch.valid = false;
@@ -217,9 +202,6 @@ namespace lucas_kanade_helpers
 
     bool applyShiTompsiCondition(const Structure_Matrix& structure_matrix)
     {
-        eigenValues2d values;
-        eigenVectors2d vectors;
-        eigenDecompose(structure_matrix, values, vectors);
-        return passesShiTomasi(values(1));
+        return passesShiTomasi(minEigenvalue(structure_matrix));
     }
 }

@@ -8,7 +8,10 @@
 namespace
 {
     constexpr int THREADS_PER_BLOCK = 256;
+    // one thread per grid point
     constexpr int BLOCK_COUNT = (flowConfig::GRID_POINT_NUM + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    // one thread per pixel
+    constexpr int PIXEL_BLOCK_COUNT = (cameraConfig::PIXEL_NUM + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     constexpr int W = cameraConfig::WIDTH;
     constexpr int H = cameraConfig::HEIGHT;
@@ -29,8 +32,8 @@ namespace
         y = static_cast<int>(grid_to_pixel(grid_index / flowConfig::GRID_WIDTH));
     }
 
-    // The grid only keeps PATCH_RADIUS pixels from the edge, but the 3x3 kernels reach one further,
-    // so edge reads are clamped (border pixels repeated).
+    // The 3x3 kernels reach one pixel past the sensor edge for border pixels, so reads are clamped
+    // (border pixels repeated). Matches the CPU version.
     __device__ inline float pixelAt(const histogram_array& hist, int x, int y)
     {
         x = min(max(x, 0), W - 1);
@@ -75,59 +78,58 @@ namespace
         return min_eigenvalue >= flowConfig::SHI_TOMPSI_MIN_THRESH;
     }
 
-    __global__ void structureMatrixSGFKernel(const histogram_array* __restrict__ hist,
-                                             Structure_Matrix_array* __restrict__ out,
-                                             const uint8_t* __restrict__ mask)
+    __global__ void hxySGFKernel(const histogram_array* __restrict__ hist, Hxy_array* __restrict__ hxy)
+    {
+        size_t pixel_index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (pixel_index >= cameraConfig::PIXEL_NUM) return;
+        (*hxy)[pixel_index] = sgfXY(*hist, static_cast<int>(pixel_index % W), static_cast<int>(pixel_index / W));
+    }
+
+    __global__ void htKernel(const histogram_array* __restrict__ newer, const histogram_array* __restrict__ older,
+                             Ht_array* __restrict__ ht)
+    {
+        size_t pixel_index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (pixel_index >= cameraConfig::PIXEL_NUM) return;
+        int x = static_cast<int>(pixel_index % W), y = static_cast<int>(pixel_index / W);
+        // second-order temporal backward difference (Rueckauer & Delbruck 2016, eq. 5)
+        (*ht)[pixel_index] = (sgfT(*newer, x, y) - sgfT(*older, x, y)) * (1.f / WINDOW_SECONDS);
+    }
+
+    __global__ void lkMatrixKernel(const Hxy_array* __restrict__ hxy, const Ht_array* __restrict__ ht,
+                                   Structure_Matrix_array* __restrict__ structure,
+                                   Time_Grad_Matrix_array* __restrict__ time_grad, const uint8_t* __restrict__ mask)
     {
         size_t grid_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (grid_index >= flowConfig::GRID_POINT_NUM) return;
-        if (!mask[grid_index]) { (*out)[grid_index].setZero(); return; }
+        if (!mask[grid_index]) {
+            (*structure)[grid_index].setZero();
+            (*time_grad)[grid_index].setZero();
+            return;
+        }
 
+        // the grid keeps centres PATCH_RADIUS from the edge, so every patch pixel is on the sensor
         int cx, cy;
         gridToPixel(grid_index, cx, cy);
-        float sxx = 0.f, sxy = 0.f, syy = 0.f;
+        float sxx = 0.f, sxy = 0.f, syy = 0.f, sxt = 0.f, syt = 0.f;
         #pragma unroll
         for (int dy = -R; dy <= R; ++dy) {
             #pragma unroll
             for (int dx = -R; dx <= R; ++dx) {
-                vector2d g = sgfXY(*hist, cx + dx, cy + dy);
+                int pixel_index = (cy + dy) * W + (cx + dx);
+                vector2d g = (*hxy)[pixel_index];
+                float htt = (*ht)[pixel_index];
                 sxx += g.x() * g.x();
                 sxy += g.x() * g.y();
                 syy += g.y() * g.y();
+                sxt += g.x() * htt;
+                syt += g.y() * htt;
             }
         }
         Structure_Matrix m;
         m << sxx, sxy,
              sxy, syy;
-        (*out)[grid_index] = m;
-    }
-
-    __global__ void timeGradMatrixKernel(const histogram_array* __restrict__ newer, const histogram_array* __restrict__ older,
-                                         Time_Grad_Matrix_array* __restrict__ out, const uint8_t* __restrict__ mask)
-    {
-        size_t grid_index = blockIdx.x * blockDim.x + threadIdx.x;
-        if (grid_index >= flowConfig::GRID_POINT_NUM) return;
-        Time_Grad_Matrix t = Time_Grad_Matrix::Zero();
-        if (mask[grid_index]) {
-            int cx, cy;
-            gridToPixel(grid_index, cx, cy);
-            float sxt = 0.f, syt = 0.f;
-            #pragma unroll
-            for (int dy = -R; dy <= R; ++dy) {
-                #pragma unroll
-                for (int dx = -R; dx <= R; ++dx) {
-                    int x = cx + dx, y = cy + dy;
-                    vector2d g = sgfXY(*newer, x, y);
-                    // second-order temporal backward difference (Rueckauer & Delbruck 2016, eq. 5)
-                    float htt = (sgfT(*newer, x, y) - sgfT(*older, x, y)) * (1.f / WINDOW_SECONDS);
-                    sxt += g.x() * htt;
-                    syt += g.y() * htt;
-                }
-            }
-            t(0) = sxt;
-            t(1) = syt;
-        }
-        (*out)[grid_index] = t;
+        (*structure)[grid_index] = m;
+        (*time_grad)[grid_index] = Time_Grad_Matrix(sxt, syt);
     }
 
     __global__ void lucasKanadeKernel(const Structure_Matrix_array* __restrict__ structure,
@@ -139,8 +141,6 @@ namespace
         flow_patch& patch = flow->patches[grid_index];
         if (!mask[grid_index]) {
             patch.flow.setZero();
-            patch.eigenValues.setZero();
-            patch.eigenVectors.setIdentity();
             patch.valid = false;
             return;
         }
@@ -148,19 +148,9 @@ namespace
         const Structure_Matrix& m = (*structure)[grid_index];
         float a = m(0, 0), b = m(0, 1), c = m(1, 1);
 
-        // closed-form eigen decomposition of the symmetric 2x2 [[a, b], [b, c]], largest first
-        float mean = 0.5f * (a + c), half_diff = 0.5f * (a - c);
-        float root = sqrtf(half_diff * half_diff + b * b);
-        float l1 = mean + root, l2 = mean - root;
-        vector2d v1;
-        if (fabsf(b) > 1e-12f) {
-            v1 = vector2d(l1 - c, b).normalized();
-        } else {
-            v1 = (a >= c) ? vector2d(1.f, 0.f) : vector2d(0.f, 1.f);
-        }
-        patch.eigenValues = eigenValues2d(l1, l2);
-        patch.eigenVectors.col(0) = v1;
-        patch.eigenVectors.col(1) = vector2d(-v1.y(), v1.x());
+        // smaller eigenvalue of the symmetric 2x2 [[a, b], [b, c]], in closed form
+        float half_diff = 0.5f * (a - c);
+        float l2 = 0.5f * (a + c) - sqrtf(half_diff * half_diff + b * b);
 
         if (!applyShiTompsiCondition(l2)) {
             mask[grid_index] = 0;
@@ -169,7 +159,7 @@ namespace
             return;
         }
 
-        // A'A v = -A'b. Shi-Tomasi passing means l2 > 0, so det = l1 * l2 > 0.
+        // A'A v = -A'b. Shi-Tomasi passing means l2 > 0, so det = l1 * l2 > 0 (l1 >= l2).
         const Time_Grad_Matrix& t = (*time_grad)[grid_index];
         float sxt = t(0), syt = t(1);
         float inv_det = 1.f / (a * c - b * b);
@@ -181,27 +171,29 @@ namespace
 
 namespace lucas_kanade_cuda
 {
-    void getStructureMatrix_array(const histogram_array* d_hist, Structure_Matrix_array* d_structure_matrix_array,
-                                  const uint8_t* d_mask, spatial_derivative method, cudaStream_t stream)
+    void getHxy_array(const histogram_array* d_hist, Hxy_array* d_hxy_array, spatial_derivative method, cudaStream_t stream)
     {
         if (method == spatial_derivative::GAUSSIAN) {
-            throw std::logic_error("lucas_kanade_cuda::getStructureMatrix_array: GAUSSIAN is not implemented");
+            throw std::logic_error("lucas_kanade_cuda::getHxy_array: GAUSSIAN is not implemented");
         }
-        structureMatrixSGFKernel<<<BLOCK_COUNT, THREADS_PER_BLOCK, 0, stream>>>(
-            d_hist, d_structure_matrix_array, d_mask);
-        cuda_util::check(cudaGetLastError(), "lucas_kanade_cuda::getStructureMatrix_array launch");
+        hxySGFKernel<<<PIXEL_BLOCK_COUNT, THREADS_PER_BLOCK, 0, stream>>>(d_hist, d_hxy_array);
+        cuda_util::check(cudaGetLastError(), "lucas_kanade_cuda::getHxy_array launch");
     }
 
-    void getTimeGradMatrix_array(const histogram_array* d_hist_newer, const histogram_array* d_hist_older,
-                                 Time_Grad_Matrix_array* d_time_grad_matrix_array, const uint8_t* d_mask,
-                                 spatial_derivative method, cudaStream_t stream)
+    void getHt_array(const histogram_array* d_hist_newer, const histogram_array* d_hist_older, Ht_array* d_ht_array,
+                     cudaStream_t stream)
     {
-        if (method == spatial_derivative::GAUSSIAN) {
-            throw std::logic_error("lucas_kanade_cuda::getTimeGradMatrix_array: GAUSSIAN is not implemented");
-        }
-        timeGradMatrixKernel<<<BLOCK_COUNT, THREADS_PER_BLOCK, 0, stream>>>(
-            d_hist_newer, d_hist_older, d_time_grad_matrix_array, d_mask);
-        cuda_util::check(cudaGetLastError(), "lucas_kanade_cuda::getTimeGradMatrix_array launch");
+        htKernel<<<PIXEL_BLOCK_COUNT, THREADS_PER_BLOCK, 0, stream>>>(d_hist_newer, d_hist_older, d_ht_array);
+        cuda_util::check(cudaGetLastError(), "lucas_kanade_cuda::getHt_array launch");
+    }
+
+    void getLKMatrix_arrays(const Hxy_array* d_hxy_array, const Ht_array* d_ht_array,
+                            Structure_Matrix_array* d_structure_matrix_array,
+                            Time_Grad_Matrix_array* d_time_grad_matrix_array, const uint8_t* d_mask, cudaStream_t stream)
+    {
+        lkMatrixKernel<<<BLOCK_COUNT, THREADS_PER_BLOCK, 0, stream>>>(
+            d_hxy_array, d_ht_array, d_structure_matrix_array, d_time_grad_matrix_array, d_mask);
+        cuda_util::check(cudaGetLastError(), "lucas_kanade_cuda::getLKMatrix_arrays launch");
     }
 
     void LK_method(const Structure_Matrix_array* d_structure_matrix_array,
